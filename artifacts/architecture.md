@@ -1,1933 +1,458 @@
 # System Architecture Document
 
 ## 1. Executive Summary
-
-The **Automated Documentation Sync System** is a local Python-based CLI application that monitors source code changes and automatically generates updated documentation using templates. The system runs as a single-process application on Windows, designed for solo developers working with Python codebases.
-
-**Architecture Philosophy**: Simple, modular, event-driven monolith prioritizing maintainability and demonstration clarity over distributed complexity. The architecture emphasizes clear separation of concerns while keeping all components in a single deployable unit suitable for local execution.
-
-**Key Technologies**: Python 3.9+, watchdog (file monitoring), GitPython (version control), Jinja2 (templating), pytest (testing)
+This system is a local, standalone command-line tool (`src/doc_sync.py`) that watches the `src/` directory for changes to Python files and keeps auto-generated sections of `README.md` in sync with the code. It runs as a single long-lived process on a developer's machine, using an event-driven filesystem watcher (`watchdog`) to detect file changes, Python's `ast` module to statically extract module/function structure (no `exec`/`import` of scanned code), and a rule-based (non-LLM) template renderer to write clearly delimited auto-generated blocks into `README.md`. The design favors simplicity, safety (read-only parsing, restricted write target), idempotency, and resilience to per-file errors over scalability or distribution — this is an in-process, single-machine developer tool, not a service.
 
 ## 2. Architecture Overview
 
 ### 2.1 Architecture Style
-**Monolithic Event-Driven Architecture**
+**Event-driven, single-process, modular monolith (CLI tool).**
 
-**Rationale**: 
-- Single-user local execution eliminates need for distributed architecture
-- Event-driven design allows asynchronous processing without blocking file watcher
-- Monolithic approach simplifies deployment, debugging, and demonstration
-- All components share same process space for efficient communication
-- Matches constraints (local Windows, solo developer, demonstration focus)
-- Easier to maintain and test for educational purposes
+**Rationale**: The requirements describe a standalone local tool with one entry point (`python -m src.doc_sync --watch`), no network API, no multi-user concerns, and a single writable output file (`README.md`). A microservices or client-server style would add operational complexity with no corresponding benefit. An event-driven internal design (filesystem events → debounce → sync pipeline) directly matches FR-1/NFR-1's requirement to avoid polling and to react to `watchdog` events.
 
 ### 2.2 High-Level Component Diagram
-
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│                         User / Developer                          │
-│                                                                    │
-│  CLI Commands: start, stop, sync, status, config                 │
-└────────────────────────────────┬─────────────────────────────────┘
-                                 │
-                                 ↓
-┌──────────────────────────────────────────────────────────────────┐
-│                      CLI Interface Layer                          │
-│  ┌────────────────────────────────────────────────────────────┐  │
-│  │  Command Parser (argparse)                                 │  │
-│  │  - Validates commands and arguments                        │  │
-│  │  - Routes to appropriate controller                        │  │
-│  └──────────────────────────┬─────────────────────────────────┘  │
-└─────────────────────────────┼────────────────────────────────────┘
-                              │
-                              ↓
-┌──────────────────────────────────────────────────────────────────┐
-│                     Application Core Layer                        │
-│                                                                    │
-│  ┌─────────────────────┐          ┌─────────────────────────┐   │
-│  │  File Watcher       │          │  Sync Orchestrator      │   │
-│  │  Service            │──events──▶│  (Main Controller)      │   │
-│  │                     │          │                         │   │
-│  │  - Monitors src/    │          │  - Coordinates workflow │   │
-│  │  - Detects changes  │          │  - Manages state        │   │
-│  │  - Debounces events │          │  - Routes operations    │   │
-│  └─────────────────────┘          └────────┬────────────────┘   │
-│                                             │                     │
-│         ┌───────────────────────────────────┼───────────────┐   │
-│         │                                   │               │   │
-│         ↓                                   ↓               ↓   │
-│  ┌─────────────────┐         ┌──────────────────┐  ┌─────────┐ │
-│  │  Code Analyzer  │         │  Doc Generator   │  │ Review  │ │
-│  │                 │─parsed──▶│                  │  │ Manager │ │
-│  │  - AST parsing  │  code   │  - Jinja2 engine │  │         │ │
-│  │  - Extract info │         │  - Template mgmt │  │ - Check │ │
-│  │  - Docstrings   │         │  - Markdown gen  │  │ severity│ │
-│  └─────────────────┘         └────────┬─────────┘  └────┬────┘ │
-│                                        │                  │      │
-│                                        └──────┬───────────┘      │
-│                                               ↓                  │
-│                              ┌────────────────────────────┐     │
-│                              │  Documentation Writer      │     │
-│                              │                            │     │
-│                              │  - Section replacement     │     │
-│                              │  - Markdown validation     │     │
-│                              │  - Backup creation         │     │
-│                              └────────────┬───────────────┘     │
-└───────────────────────────────────────────┼──────────────────────┘
-                                            │
-                                            ↓
-┌──────────────────────────────────────────────────────────────────┐
-│                    Integration Layer                              │
-│                                                                    │
-│  ┌──────────────────┐    ┌──────────────────┐  ┌──────────────┐ │
-│  │  Git Manager     │    │  JIRA Client     │  │  Secret      │ │
-│  │                  │    │                  │  │  Detector    │ │
-│  │  - GitPython API │    │  - REST API v2   │  │              │ │
-│  │  - Commit/push   │    │  - Add comments  │  │  - Pattern   │ │
-│  │  - Conflict mgmt │    │  - Link issues   │  │    matching  │ │
-│  └────────┬─────────┘    └────────┬─────────┘  │  - Sanitize  │ │
-│           │                       │             └──────────────┘ │
-└───────────┼───────────────────────┼──────────────────────────────┘
-            │                       │
-            ↓                       ↓
-┌──────────────────────────────────────────────────────────────────┐
-│                    External Services                              │
-│                                                                    │
-│  ┌──────────────────────┐         ┌─────────────────────────┐   │
-│  │  Git Remote          │         │  JIRA Server            │   │
-│  │  (GitHub/GitLab/     │         │  (jiraeu.epam.com)      │   │
-│  │   Bitbucket)         │         │                         │   │
-│  └──────────────────────┘         └─────────────────────────┘   │
-└──────────────────────────────────────────────────────────────────┘
-
-┌──────────────────────────────────────────────────────────────────┐
-│                      Supporting Services                          │
-│                                                                    │
-│  ┌─────────────────┐  ┌──────────────┐  ┌───────────────────┐  │
-│  │  Config Manager │  │  Logger      │  │  Metrics Tracker  │  │
-│  │                 │  │              │  │                   │  │
-│  │  - Load config  │  │  - File log  │  │  - Success rate   │  │
-│  │  - Env vars     │  │  - Console   │  │  - Duration       │  │
-│  │  - Validation   │  │  - Rotation  │  │  - Operations     │  │
-│  └─────────────────┘  └──────────────┘  └───────────────────┘  │
-└──────────────────────────────────────────────────────────────────┘
-
-┌──────────────────────────────────────────────────────────────────┐
-│                      Persistence Layer                            │
-│                                                                    │
-│  ┌─────────────┐  ┌─────────────┐  ┌────────────┐  ┌──────────┐│
-│  │  Config     │  │  Templates  │  │  Log Files │  │ Metrics  ││
-│  │  File       │  │  Directory  │  │            │  │  JSON    ││
-│  │  (YAML)     │  │  (Jinja2)   │  │  (.log)    │  │          ││
-│  └─────────────┘  └─────────────┘  └────────────┘  └──────────┘│
-└──────────────────────────────────────────────────────────────────┘
+                          Developer Machine (single process)
+        ┌───────────────────────────────────────────────────────────────┐
+        │                                                                │
+        │   ┌───────────────┐      events       ┌───────────────────┐   │
+        │   │  File Watcher │ ───────────────▶   │  Event Debouncer  │   │
+        │   │  (watchdog)   │                    │  (coalesce bursts)│   │
+        │   └───────────────┘                    └─────────┬─────────┘   │
+        │          ▲                                        │             │
+        │          │ watches                                ▼             │
+        │   ┌───────────────┐                       ┌───────────────────┐│
+        │   │   src/*.py    │◀──── read-only ───────│   Sync Orchestrator│
+        │   │ (filesystem)  │       ast.parse        │  (pipeline runner) │
+        │   └───────────────┘                        └─────────┬─────────┘
+        │                                                        │           │
+        │                                              ┌─────────▼─────────┐ │
+        │                                              │  AST Extractor    │ │
+        │                                              │ (ModuleInfo/      │ │
+        │                                              │  FunctionInfo)    │ │
+        │                                              └─────────┬─────────┘ │
+        │                                                        │           │
+        │                                              ┌─────────▼─────────┐ │
+        │                                              │ Markdown Renderer │ │
+        │                                              │ (rule-based       │ │
+        │                                              │  templates)       │ │
+        │                                              └─────────┬─────────┘ │
+        │                                                        │           │
+        │                                              ┌─────────▼─────────┐ │
+        │                                              │ README Sync Writer│ │
+        │                                              │ (marker-block     │ │
+        │                                              │  read/patch/write)│ │
+        │                                              └─────────┬─────────┘ │
+        │                                                        │           │
+        │                                                        ▼           │
+        │                                                  README.md        │
+        │                                                                    │
+        │   ┌───────────────┐                                               │
+        │   │  Logger        │◀── warnings/info from all components         │
+        │   │  (stdlib logging)                                             │
+        │   └───────────────┘                                               │
+        └───────────────────────────────────────────────────────────────┘
 ```
 
 ### 2.3 Component Descriptions
 
-#### Component: File Watcher Service
-- **Purpose**: Monitor Python files in src/ directory and detect changes
-- **Responsibilities**: 
-  - Initialize watchdog file system observer
-  - Watch for create, modify, delete events on .py files
-  - Debounce rapid successive changes (300ms window)
-  - Emit normalized change events to Sync Orchestrator
-  - Handle watcher errors and continue monitoring
-- **Technology**: Python `watchdog` library with Observer pattern
-- **Interfaces**: 
-  - Emits: `CodeChangeEvent(file_path, change_type, timestamp, content)`
-  - Configuration: watch_directory, file_patterns
-- **Scaling**: Single-threaded observer, efficient for local file systems
+#### Component: File Watcher
+- **Purpose**: Detect create/modify/delete events on `.py` files under `src/`.
+- **Responsibilities**:
+  - Register a recursive `watchdog` `Observer` on `src/`.
+  - Filter events to `.py` files only; ignore all other file types.
+  - Emit normalized internal events (path, change type) to the Event Debouncer.
+- **Technology**: `watchdog.observers.Observer` + a custom `FileSystemEventHandler`.
+- **Interfaces**: Consumes OS filesystem events; produces `ChangeEvent(path, kind)` objects.
+- **Scaling**: N/A (single watcher, single machine); relies on OS-level file event APIs (inotify/FSEvents/ReadDirectoryChangesW) for efficiency, satisfying NFR-1's no-polling requirement.
+
+#### Component: Event Debouncer
+- **Purpose**: Coalesce bursts of rapid events (e.g., autosave, `git checkout`) into a single sync trigger, per the Risks section of requirements.
+- **Responsibilities**:
+  - Buffer incoming `ChangeEvent`s within a short window (e.g., 300–500ms).
+  - Deduplicate multiple events for the same path within the window.
+  - Trigger the Sync Orchestrator once the window elapses with the set of changed paths.
+- **Technology**: Plain Python using `threading.Timer` (or a simple loop with timestamps); no external dependency needed.
+- **Interfaces**: Consumes `ChangeEvent`s; produces a batched `set[Path]` to the Sync Orchestrator.
+- **Scaling**: In-memory, single-process; bounded by number of files under `src/` (NFR-3: ≤100 files comfortably).
 
 #### Component: Sync Orchestrator
-- **Purpose**: Central controller coordinating the documentation sync workflow
-- **Responsibilities**: 
-  - Receive file change events from File Watcher
-  - Queue and deduplicate changes (batch window: 2 seconds)
-  - Create SyncOperation for each batch
-  - Coordinate: CodeAnalyzer → DocGenerator → ReviewManager → DocWriter → GitManager
-  - Manage operation state (pending → in_progress → completed/failed)
-  - Track performance metrics
-  - Handle errors and recovery
-  - Notify on completion/failure
-- **Technology**: Python asyncio for async coordination
-- **Interfaces**: 
-  - Input: CodeChangeEvent queue
-  - Output: SyncOperation status updates
-  - Uses: All service components
-- **Scaling**: Event loop handles multiple operations efficiently
+- **Purpose**: Coordinate a single sync pass: decide which modules need re-extraction, call the AST Extractor, call the Markdown Renderer, and call the README Sync Writer; also handles full-project sync at startup.
+- **Responsibilities**:
+  - On startup, enumerate all `.py` files under `src/` for an initial full sync.
+  - On a debounced batch, run the pipeline only for changed/deleted modules (targeted sync).
+  - Determine deletions (module file removed) and route them to the README Sync Writer for block removal.
+  - Catch and route per-file exceptions to the Logger without aborting the batch (FR-5).
+- **Technology**: Plain Python module/class (`SyncOrchestrator`) within `src/doc_sync.py` (or a package under `src/doc_sync/`).
+- **Interfaces**: Internal function calls only; no external API.
+- **Scaling**: Processes files sequentially (simplicity over throughput); acceptable per NFR-3 (100 files / 10s budget), can be parallelized later if needed (see Future Considerations).
 
-#### Component: Code Analyzer
-- **Purpose**: Parse Python code and extract relevant information for documentation
-- **Responsibilities**: 
-  - Parse Python files using AST (Abstract Syntax Tree)
-  - Extract functions, classes, methods with signatures
-  - Parse docstrings (Google, NumPy, or Sphinx style)
-  - Extract type hints and parameter information
-  - Identify public API (not starting with _)
-  - Calculate file hash for change detection
-  - Handle syntax errors gracefully
-- **Technology**: Python `ast` module (built-in)
-- **Interfaces**: 
-  - Input: File path, file content
-  - Output: `ParsedCodeStructure` (classes, functions, docstrings)
-- **Scaling**: Synchronous processing per file
+#### Component: AST Extractor
+- **Purpose**: Statically parse a `.py` file into a `ModuleInfo` data structure without executing it.
+- **Responsibilities**:
+  - Read file content (with explicit UTF-8 decoding, tolerant error handling for encoding issues).
+  - Call `ast.parse(source, filename=path)`; on `SyntaxError`, raise a typed extraction error caught upstream.
+  - Walk the module's top-level `ast.FunctionDef` nodes (excluding nested functions and class bodies) to build `FunctionInfo` entries.
+  - Render each function's signature as a string from `ast.arguments` (positional, defaults, `*args`, `**kwargs`, return annotation).
+- **Technology**: Python stdlib `ast`, `inspect`-free (pure AST walking, no `exec`/`import`) — satisfies NFR-2.
+- **Interfaces**: `extract_module(path: Path) -> ModuleInfo` (raises `ExtractionError` on failure).
+- **Scaling**: O(file size); bounded by NFR-1 (2s per file up to 2,000 lines).
 
-#### Component: Doc Generator
-- **Purpose**: Generate documentation content using templates
-- **Responsibilities**: 
-  - Load Jinja2 templates from templates/ directory
-  - Map code structures to template variables
-  - Generate README sections (API Examples, Configuration)
-  - Generate API documentation pages
-  - Validate generated Markdown
-  - Support custom template filters
-- **Technology**: Jinja2 template engine
-- **Interfaces**: 
-  - Input: ParsedCodeStructure, template name
-  - Output: Generated Markdown content
-- **Scaling**: Template caching for performance
+#### Component: Markdown Renderer
+- **Purpose**: Convert a `ModuleInfo` into the exact auto-generated Markdown block text for a module.
+- **Responsibilities**:
+  - Render module dotted path as a subheading (e.g., `### src.foo`).
+  - Render module docstring (or omit if `None`).
+  - Render each function as a subheading/bullet with its signature as a code span and its docstring text.
+  - Guarantee deterministic, idempotent output (identical `ModuleInfo` → byte-identical block) — required for FR-3's no-diff-on-rerun criterion.
+- **Technology**: Plain Python string templates (f-strings), no external templating engine (keeps output fully deterministic and dependency-free).
+- **Interfaces**: `render_block(module_info: ModuleInfo) -> str`.
+- **Scaling**: O(number of functions); negligible cost.
 
-#### Component: Review Manager
-- **Purpose**: Determine if documentation changes require manual review
-- **Responsibilities**: 
-  - Calculate change severity (minor, moderate, major)
-  - Check structural changes (new/removed sections)
-  - Count lines changed (threshold: 50 lines)
-  - Identify changes to critical sections
-  - Prompt user for review when needed
-  - Record review decisions
-- **Technology**: Python with diff algorithms
-- **Interfaces**: 
-  - Input: Old docs, new docs, DocumentationUpdate
-  - Output: Review decision (approve/reject), severity
-  - User interaction: Console prompts
-- **Scaling**: Synchronous, interactive when review needed
+#### Component: README Sync Writer
+- **Purpose**: Safely read, patch, and write `README.md`, replacing only the marker-delimited blocks that changed.
+- **Responsibilities**:
+  - Parse existing `README.md` to locate `<!-- AUTO-DOC:START module=X -->` / `<!-- AUTO-DOC:END module=X -->` pairs and build a map of `module -> (start_idx, end_idx)`.
+  - Validate marker integrity (no unmatched/duplicated markers per module); on malformation, skip that module and log a warning (per Risks section) rather than guessing.
+  - For each changed module: replace its block content in place, or append a new block (under `## API Reference` if present, else at end of file) if none exists yet.
+  - For each deleted module: remove its entire block (including markers).
+  - Write the file atomically (write to a temp file in the same directory, then `os.replace`) to avoid partial/corrupted writes if the process is interrupted mid-write.
+- **Technology**: Plain Python file I/O + `re`/string parsing for marker detection; `os.replace` for atomic writes.
+- **Interfaces**: `sync_readme(readme_path: Path, blocks: dict[str, str | None]) -> SyncResult` (`None` value signals block removal).
+- **Scaling**: O(README size + number of blocks); README size is expected to be small (developer-authored doc file).
 
-#### Component: Documentation Writer
-- **Purpose**: Update documentation files with generated content
-- **Responsibilities**: 
-  - Identify auto-generated sections (HTML markers)
-  - Replace sections while preserving manual content
-  - Create backups before changes
-  - Validate Markdown syntax
-  - Atomic file writes (write to temp, rename)
-  - Rollback on validation failure
-- **Technology**: Python file I/O with tempfile
-- **Interfaces**: 
-  - Input: Target file path, generated content, sections
-  - Output: Updated file, backup path
-- **Scaling**: File locking for safety
-
-#### Component: Git Manager
-- **Purpose**: Integrate with Git version control
-- **Responsibilities**: 
-  - Initialize GitPython repository connection
-  - Stage modified documentation files
-  - Create descriptive commit messages
-  - Tag as automated update
-  - Push to configured remote (optional)
-  - Handle merge conflicts (code takes precedence)
-  - Authenticate using credentials
-- **Technology**: GitPython library
-- **Interfaces**: 
-  - Input: File paths, commit message
-  - Output: Commit hash, success/failure
-  - Configuration: git_enabled, git_remote
-- **Scaling**: Synchronous git operations
-
-#### Component: JIRA Client
-- **Purpose**: Integrate with JIRA for traceability
-- **Responsibilities**: 
-  - Authenticate with JIRA REST API v2
-  - Extract issue keys from branch names or commits
-  - Add comments to JIRA stories
-  - Link commits to issues
-  - Handle API errors gracefully
-  - Rate limiting and retry logic
-- **Technology**: Python `requests` library
-- **Interfaces**: 
-  - Input: Issue key, comment text, commit hash
-  - Output: Success/failure status
-  - Configuration: jira_enabled, jira_url, credentials
-- **Scaling**: Async requests, optional (low priority)
-
-#### Component: Secret Detector
-- **Purpose**: Prevent secrets from being committed in documentation
-- **Responsibilities**: 
-  - Scan generated docs for secret patterns
-  - Patterns: API keys, passwords, tokens, private keys
-  - Regular expression matching
-  - Redact or alert on detection
-  - Whitelist approved patterns
-- **Technology**: Python regex library
-- **Interfaces**: 
-  - Input: Documentation content
-  - Output: Detection results, sanitized content
-- **Scaling**: Fast regex scanning
-
-#### Component: Config Manager
-- **Purpose**: Manage application configuration
-- **Responsibilities**: 
-  - Load from YAML config file
-  - Override with environment variables
-  - Provide sensible defaults
-  - Validate configuration
-  - Expose configuration to components
-- **Technology**: Python `pyyaml` library
-- **Interfaces**: 
-  - Input: config.yaml, environment variables
-  - Output: Configuration object
-- **Scaling**: Load once at startup
+#### Component: Path Validator
+- **Purpose**: Ensure all paths derived from watcher events resolve inside the workspace root before being opened (NFR-2).
+- **Responsibilities**: Resolve each candidate path with `Path.resolve()` and confirm it is relative to the workspace root; reject/log-and-skip otherwise.
+- **Technology**: Python stdlib `pathlib`.
+- **Interfaces**: `is_within_workspace(path: Path, root: Path) -> bool`, called by the Sync Orchestrator before any file is opened.
+- **Scaling**: O(1) per file.
 
 #### Component: Logger
-- **Purpose**: Centralized logging for all components
-- **Responsibilities**: 
-  - Configure Python logging module
-  - File logging with rotation (10MB, 5 backups)
-  - Console logging with colors
-  - Structured logging format (timestamp, level, component, message)
-  - Performance logging for metrics
-  - Never log credentials
-- **Technology**: Python `logging` module
-- **Interfaces**: 
-  - Used by: All components
-  - Output: Log files, console
-- **Scaling**: Thread-safe logging
-
-#### Component: Metrics Tracker
-- **Purpose**: Track and report performance metrics
-- **Responsibilities**: 
-  - Record sync operations (start, end, duration)
-  - Calculate success rate
-  - Calculate average sync duration
-  - Persist metrics to JSON file
-  - Report metrics via status command
-- **Technology**: Python with JSON persistence
-- **Interfaces**: 
-  - Input: SyncOperation events
-  - Output: metrics.json, status reports
-- **Scaling**: In-memory with periodic persistence
+- **Purpose**: Provide structured, leveled console logging for sync pass start/end, per-file changes, and warnings (FR-5, NFR-4).
+- **Responsibilities**: Emit `INFO` logs for sync pass start, files changed, sections added/updated/removed; emit `WARNING` logs for per-file failures with file path + exception message; never raise.
+- **Technology**: Python stdlib `logging`, configured with a `StreamHandler` to stderr/stdout and a simple formatter.
+- **Interfaces**: Standard `logging.getLogger(__name__)` used by all components.
+- **Scaling**: N/A.
 
 ## 3. Technology Stack
 
 ### 3.1 Frontend
-**Not Applicable** - This is a CLI-only application with no graphical interface.
+- Not applicable — this is a CLI-only developer tool with no UI.
 
 ### 3.2 Backend
+- **Language**: Python 3.x (matching the requirement's technical stack and the existing repo).
+- **Framework**: None (plain stdlib + `watchdog`); a framework would be over-engineering for a single-purpose CLI tool.
+- **API Style**: None — no network API in this iteration (per requirements' API Specifications).
+- **Entry Point**: `python -m src.doc_sync --watch`, implemented via `argparse` for CLI argument parsing and a `if __name__ == "__main__":` guard.
+- **Authentication**: Not applicable (local process, no network exposure).
 
-- **Language**: Python 3.9+
-  - **Justification**: 
-    - Required by project constraints
-    - Excellent libraries for file watching, Git, templates
-    - Cross-platform with good Windows support
-    - Rapid development for demonstration purposes
-    - Rich ecosystem for code parsing (AST)
-    - Team expertise (solo developer knows Python)
+### 3.3 Database
+- Not applicable. The system has no database; its only persistent state is the workspace filesystem (`src/*.py` read-only, `README.md` read/write). No caching layer, search index, or message queue is required given the tool's scope and NFR-3's modest scale (≤100 files, ≤10s full sync).
 
-- **CLI Framework**: `argparse` (built-in)
-  - **Justification**: Standard library, no dependencies, sufficient for simple CLI
+### 3.4 Infrastructure
+- **Cloud Provider**: None — runs entirely on the developer's local machine.
+- **Container Orchestration**: None.
+- **CI/CD**: Out of scope per requirements (explicitly excludes CI/CD pipeline integration); repo may still run unit tests locally via `pytest` but no pipeline is designed here.
+- **Monitoring**: Console logging only (see Logger component); no external monitoring stack, consistent with a local dev tool.
+- **Logging**: Python stdlib `logging` to stdout/stderr; no log aggregation needed at this scale.
 
-- **Async Framework**: `asyncio` (built-in)
-  - **Justification**: Built-in, allows non-blocking operations, efficient event loop
-
-### 3.3 Core Libraries
-
-- **File Watching**: `watchdog` 3.0+
-  - **Justification**: Industry standard, excellent Windows support, battle-tested, event-driven
-
-- **Git Integration**: `GitPython` 3.1+
-  - **Justification**: Pure Python, comprehensive Git API, well-documented, active maintenance
-
-- **Template Engine**: `Jinja2` 3.1+
-  - **Justification**: Powerful, flexible, widely used, extensive filter support, good error handling
-
-- **Code Parsing**: `ast` (built-in)
-  - **Justification**: Official Python parser, no dependencies, accurate, safe
-
-- **Markdown Processing**: `markdown` 3.4+
-  - **Justification**: Validation and parsing, extensible, pure Python
-
-- **HTTP Client**: `requests` 2.31+
-  - **Justification**: Simple API, robust, handles auth well (for JIRA)
-
-- **Configuration**: `pyyaml` 6.0+
-  - **Justification**: Human-readable config format, supports complex structures
-
-### 3.4 Development & Quality Tools
-
-- **Testing Framework**: `pytest` 7.4+
-  - **Fixtures**: For test setup and teardown
-  - **Mocking**: `pytest-mock` for mocking external services
-  - **Coverage**: `pytest-cov` for code coverage reporting
-  - **Target**: ≥ 70% coverage for core functionality
-
-- **Code Formatting**: `black` 23.0+
-  - **Justification**: Opinionated, consistent, PEP 8 compliant
-
-- **Linting**: `pylint` 2.17+
-  - **Justification**: Comprehensive, catches errors, enforces standards
-
-- **Type Checking**: `mypy` 1.5+ (optional)
-  - **Justification**: Catch type errors early, document interfaces
-
-### 3.5 Infrastructure
-
-- **Operating System**: Windows 10/11
-  - **Requirement**: Project constraint
-
-- **Python Distribution**: Standard CPython 3.9+
-  - **Installation**: Via python.org or Microsoft Store
-
-- **Version Control**: Git 2.40+
-  - **Assumption**: Already installed on developer machine
-
-- **Package Management**: `pip` with `requirements.txt`
-  - **Virtual Environment**: `venv` (built-in)
-
-### 3.6 Third-Party Services
-
-- **Git Hosting**: GitHub / GitLab / Bitbucket
-  - **Integration**: Via Git protocol (HTTPS or SSH)
-  - **Authentication**: Personal access tokens or SSH keys
-
-- **JIRA**: JIRA Cloud or Server (REST API v2)
-  - **Integration**: REST API via requests library
-  - **Authentication**: API tokens or username/password
+### 3.5 Third-Party Services
+- **`watchdog`** (PyPI package): Purpose — event-driven, cross-platform filesystem watching, avoiding a manual polling loop (NFR-1). No other third-party services or network calls are used, per the explicit "no LLM or external network calls" constraint.
 
 ## 4. Data Architecture
 
 ### 4.1 Data Models
+These are in-memory dataclasses only — there is no database; they exist for the duration of a sync pass.
 
-#### Entity: CodeChange
-```
-In-Memory Structure (dataclass)
-┌──────────────────┬──────────────┬────────────────────────────────┐
-│ Field            │ Type         │ Purpose                        │
-├──────────────────┼──────────────┼────────────────────────────────┤
-│ file_path        │ str          │ Absolute path to changed file  │
-│ change_type      │ str          │ "created", "modified",         │
-│                  │              │ "deleted"                      │
-│ timestamp        │ datetime     │ When change was detected       │
-│ content          │ str          │ File content (if applicable)   │
-│ previous_hash    │ str          │ SHA256 of previous version     │
-│ current_hash     │ str          │ SHA256 of current version      │
-└──────────────────┴──────────────┴────────────────────────────────┘
-```
+**ModuleInfo**
+| Field | Type | Constraints | Purpose |
+|---|---|---|---|
+| `module_path` | `str` | dotted path relative to `src/` (e.g. `src.foo.bar`) | Stable key used for marker matching and README block identity |
+| `docstring` | `str \| None` | raw module docstring text, or `None` if absent | Rendered under the module subheading |
+| `functions` | `list[FunctionInfo]` | ordered as they appear in source | Rendered as the module's function list |
 
-**Relationships**: Part of SyncOperation
-**Storage**: In-memory only, not persisted
+**FunctionInfo**
+| Field | Type | Constraints | Purpose |
+|---|---|---|---|
+| `name` | `str` | function identifier | Rendered as function subheading/bullet label |
+| `signature` | `str` | rendered from `ast.arguments` + return annotation | Rendered as a single-line code span |
+| `docstring` | `str \| None` | first line and full text both available | Rendered as descriptive text under the signature |
 
-#### Entity: ParsedCodeStructure
-```
-In-Memory Structure (dataclass)
-┌──────────────────┬──────────────┬────────────────────────────────┐
-│ Field            │ Type         │ Purpose                        │
-├──────────────────┼──────────────┼────────────────────────────────┤
-│ file_path        │ str          │ Source file path               │
-│ module_docstring │ str          │ Module-level documentation     │
-│ imports          │ List[str]    │ Import statements              │
-│ classes          │ List[Class]  │ Class definitions              │
-│ functions        │ List[Func]   │ Function definitions           │
-│ constants        │ Dict         │ Module-level constants         │
-└──────────────────┴──────────────┴────────────────────────────────┘
-
-Nested: ClassInfo
-┌──────────────────┬──────────────┬────────────────────────────────┐
-│ name             │ str          │ Class name                     │
-│ docstring        │ str          │ Class documentation            │
-│ bases            │ List[str]    │ Base classes                   │
-│ methods          │ List[Method] │ Method definitions             │
-│ attributes       │ List[Attr]   │ Class attributes               │
-│ is_public        │ bool         │ Not starting with _            │
-└──────────────────┴──────────────┴────────────────────────────────┘
-
-Nested: FunctionInfo
-┌──────────────────┬──────────────┬────────────────────────────────┐
-│ name             │ str          │ Function name                  │
-│ docstring        │ str          │ Function documentation         │
-│ signature        │ str          │ Full signature with types      │
-│ parameters       │ List[Param]  │ Parameter details              │
-│ return_type      │ str          │ Return type annotation         │
-│ is_async         │ bool         │ Is async function              │
-│ is_public        │ bool         │ Not starting with _            │
-└──────────────────┴──────────────┴────────────────────────────────┘
-```
-
-**Relationships**: Generated by CodeAnalyzer, consumed by DocGenerator
-**Storage**: In-memory only
-
-#### Entity: DocumentationUpdate
-```
-In-Memory Structure (dataclass)
-┌──────────────────┬──────────────────┬─────────────────────────────┐
-│ Field            │ Type             │ Purpose                     │
-├──────────────────┼──────────────────┼─────────────────────────────┤
-│ doc_type         │ str              │ "README" or "API"           │
-│ target_file      │ str              │ Path to doc file            │
-│ sections         │ List[str]        │ Sections to update          │
-│ generated_content│ str              │ New documentation content   │
-│ requires_review  │ bool             │ Manual review needed?       │
-│ severity         │ str              │ "minor", "moderate",        │
-│                  │                  │ "major"                     │
-│ source_changes   │ List[CodeChange] │ Related code changes        │
-│ backup_path      │ str              │ Backup file location        │
-└──────────────────┴──────────────────┴─────────────────────────────┘
-```
-
-**Relationships**: Part of SyncOperation
-**Storage**: In-memory, optionally logged
-
-#### Entity: SyncOperation
-```
-In-Memory Structure + JSON Persistence (for metrics)
-┌──────────────────┬───────────────────┬────────────────────────────┐
-│ Field            │ Type              │ Purpose                    │
-├──────────────────┼───────────────────┼────────────────────────────┤
-│ id               │ str (UUID)        │ Unique operation ID        │
-│ status           │ str               │ "pending", "in_progress",  │
-│                  │                   │ "completed", "failed"      │
-│ start_time       │ datetime          │ When operation started     │
-│ end_time         │ datetime          │ When operation finished    │
-│ duration_seconds │ float             │ Total duration             │
-│ code_changes     │ List[CodeChange]  │ Code files changed         │
-│ doc_updates      │ List[DocUpdate]   │ Documentation updates      │
-│ errors           │ List[str]         │ Error messages             │
-│ committed        │ bool              │ Committed to Git?          │
-│ commit_hash      │ str               │ Git commit SHA             │
-│ review_required  │ bool              │ Did it need review?        │
-│ review_approved  │ bool              │ Was review approved?       │
-└──────────────────┴───────────────────┴────────────────────────────┘
-```
-
-**Relationships**: Root entity containing all operation data
-**Storage**: In-memory during execution, persisted summary to metrics.json
-
-#### Entity: Configuration
-```
-File: config.yaml
-┌──────────────────────────┬──────────┬────────────────────────────┐
-│ Field                    │ Type     │ Default                    │
-├──────────────────────────┼──────────┼────────────────────────────┤
-│ watch_directory          │ str      │ "src/"                     │
-│ readme_path              │ str      │ "README.md"                │
-│ api_doc_path             │ str      │ "docs/API.md"              │
-│ templates_directory      │ str      │ "templates/"               │
-│ review_threshold_lines   │ int      │ 50                         │
-│ git_enabled              │ bool     │ true                       │
-│ git_remote               │ str      │ "origin"                   │
-│ git_auto_push            │ bool     │ false                      │
-│ jira_enabled             │ bool     │ false                      │
-│ jira_url                 │ str      │ ""                         │
-│ notification_channels    │ list     │ ["console"]                │
-│ log_file                 │ str      │ "doc_sync.log"             │
-│ log_level                │ str      │ "INFO"                     │
-│ performance_metrics      │ bool     │ true                       │
-│ metrics_file             │ str      │ "metrics.json"             │
-│ debounce_seconds         │ float    │ 0.3                        │
-│ batch_window_seconds     │ float    │ 2.0                        │
-└──────────────────────────┴──────────┴────────────────────────────┘
-```
-
-**Storage**: config.yaml file, loaded at startup
-**Override**: Environment variables (e.g., DOC_SYNC_GIT_ENABLED)
-
-#### Entity: Metrics (Persisted)
-```
-File: metrics.json
-{
-  "total_operations": 0,
-  "successful_operations": 0,
-  "failed_operations": 0,
-  "total_duration_seconds": 0.0,
-  "operations_history": [
-    {
-      "id": "uuid",
-      "timestamp": "ISO 8601",
-      "duration_seconds": 0.0,
-      "status": "completed|failed",
-      "files_changed": 0,
-      "docs_updated": 0,
-      "review_required": false
-    }
-    // Last 100 operations
-  ],
-  "last_updated": "ISO 8601"
-}
-```
-
-**Purpose**: Track performance metrics for success rate and duration reporting
-**Updates**: After each sync operation
-**Retention**: Last 100 operations
+**No relational schema or indexes are needed** — these are transient in-memory structures produced per sync pass and discarded after rendering.
 
 ### 4.2 Data Flow Diagram
-
 ```
-File Change in src/
-       ↓
-[File System Event]
-       ↓
-[File Watcher Service] ─────────────┐
-       │                            │
-       │ (debounce 300ms)           │ (watches)
-       ↓                            │
-[Event Queue]                       │
-       │                            │
-       │ (batch 2s)                 ↓
-       ↓                    [File System src/]
-[Sync Orchestrator]
-       │
-       │ Create SyncOperation
-       │
-       ├─→ [Code Analyzer]
-       │          │
-       │          │ Parse AST
-       │          ↓
-       │   [ParsedCodeStructure]
-       │          │
-       │          ↓
-       ├─→ [Doc Generator]
-       │          │
-       │          │ Apply templates
-       │          ↓
-       │   [Generated Markdown]
-       │          │
-       │          ↓
-       ├─→ [Review Manager]
-       │          │
-       │          ├─→ (if severe) [User Prompt] → (Approve/Reject)
-       │          │
-       │          ↓
-       │   [Review Decision]
-       │          │
-       │          ↓ (if approved)
-       ├─→ [Secret Detector]
-       │          │
-       │          │ Scan for secrets
-       │          ↓
-       │   [Sanitized Content]
-       │          │
-       │          ↓
-       ├─→ [Documentation Writer]
-       │          │
-       │          ├─→ Create backup
-       │          ├─→ Update sections
-       │          ├─→ Validate
-       │          ↓
-       │   [Updated Doc Files]
-       │          │
-       │          ↓
-       ├─→ [Git Manager] (if git_enabled)
-       │          │
-       │          ├─→ Stage files
-       │          ├─→ Commit
-       │          ├─→ Push (if auto_push)
-       │          ↓
-       │   [Git Commit Hash]
-       │          │
-       │          ↓
-       ├─→ [JIRA Client] (if jira_enabled)
-       │          │
-       │          └─→ Add comment to issue
-       │
-       ├─→ [Metrics Tracker]
-       │          │
-       │          └─→ Record operation
-       │
-       └─→ [Logger]
-              │
-              └─→ Log success/failure
+ watchdog event ──▶ Path Validator ──▶ Event Debouncer ──▶ Sync Orchestrator
+                                                                │
+                                     ┌──────────────────────────┼───────────────────────────┐
+                                     │ (for each changed module) │ (for each deleted module) │
+                                     ▼                           ▼
+                             AST Extractor              (no extraction — mark for removal)
+                                     │
+                                     ▼
+                             Markdown Renderer
+                                     │
+                                     ▼
+                          README Sync Writer ──▶ README.md (atomic write)
+                                     │
+                                     ▼
+                                  Logger (INFO: sections added/updated/removed)
 ```
 
-**Detailed Flow for Documentation Sync Operation:**
-
-1. **File Watcher** detects change in src/example.py
-2. **Debouncing**: Wait 300ms for additional changes
-3. **Event Queue**: Add CodeChangeEvent to queue
-4. **Batching**: Wait 2 seconds for related changes
-5. **Sync Orchestrator**: Create SyncOperation with UUID
-6. **Code Analyzer**: 
-   - Read example.py content
-   - Parse using AST
-   - Extract functions, classes, docstrings
-   - Return ParsedCodeStructure
-7. **Doc Generator**:
-   - Load appropriate Jinja2 templates
-   - Map parsed code to template variables
-   - Render README API section
-   - Render API documentation
-   - Return generated Markdown
-8. **Review Manager**:
-   - Compare old vs new documentation
-   - Calculate lines changed, structural changes
-   - Determine severity
-   - If major/critical: Prompt user for review
-   - User approves/rejects
-9. **Secret Detector**:
-   - Scan generated content with regex patterns
-   - Check for API keys, tokens, passwords
-   - Redact or alert if found
-10. **Documentation Writer**:
-    - Create backup of README.md
-    - Find auto-generated section markers
-    - Replace section content atomically
-    - Validate Markdown syntax
-    - Rollback if validation fails
-11. **Git Manager** (if enabled):
-    - Stage README.md and docs/API.md
-    - Create commit message: "docs: auto-update from example.py changes"
-    - Commit with [automated] tag
-    - Push to remote (if auto_push)
-    - Return commit hash
-12. **JIRA Client** (if enabled):
-    - Extract issue key from branch name
-    - Post comment: "Documentation updated in commit {hash}"
-13. **Metrics Tracker**:
-    - Record end_time, duration, status
-    - Update success/failure counts
-    - Persist to metrics.json
-14. **Logger**:
-    - Log completion: "Sync operation {id} completed in 45.2s"
-15. **User Notification**:
-    - Console: "✓ Documentation synced successfully (45.2s)"
-
-**Error Handling Path:**
-- Any component failure → Log error → Mark SyncOperation as failed → Continue monitoring
-- Validation failure → Rollback changes → Notify user → Log details
-- Git conflict → Log conflict → Attempt resolution (code precedence) → Notify user
+**Detailed Flow for "Function added to an existing module":**
+1. `watchdog` emits a `modified` event for `src/foo.py` → Path Validator confirms it resolves within the workspace root.
+2. Event Debouncer buffers the event for the coalescing window, then forwards `{src/foo.py}` to the Sync Orchestrator.
+3. Sync Orchestrator calls AST Extractor on `src/foo.py`, producing a `ModuleInfo` with the updated `functions` list.
+4. Markdown Renderer converts `ModuleInfo` into the full `<!-- AUTO-DOC:START module=src.foo -->...<!-- AUTO-DOC:END module=src.foo -->` block text.
+5. README Sync Writer locates the existing marker pair for `src.foo` in `README.md`, replaces only the content between the markers, and writes the file atomically.
+6. Logger emits an `INFO` line: sync pass started, `src/foo.py` changed, section `src.foo` updated.
+7. **Error handling path**: if step 3 raises `ExtractionError` (e.g. `SyntaxError`), the Sync Orchestrator catches it, logs a `WARNING` with the file path and exception message, leaves the module's existing README block untouched, and continues processing any other changed files in the batch (FR-5).
 
 ### 4.3 Caching Strategy
-
-**Template Caching:**
-- **Cache Layer**: In-memory Jinja2 environment with auto-reload
-- **Cache Keys**: Template file path
-- **TTL Strategy**: Reload if file modified (watch template directory)
-- **Invalidation**: File system watch or manual reload command
-
-**Code Analysis Caching:**
-- **Cache Layer**: In-memory dictionary keyed by file hash
-- **Cache Keys**: SHA256(file_content)
-- **TTL Strategy**: Invalidate when file hash changes
-- **Benefit**: Skip re-parsing if file hasn't changed (only timestamp update)
-
-**Configuration Caching:**
-- **Cache Layer**: Singleton ConfigManager
-- **TTL Strategy**: Load once at startup, reload on SIGHUP or manual command
-- **Invalidation**: `doc_sync.py config reload` command
-
-**No Database Caching**: This is a local single-user application; database caching is not applicable.
+- No caching layer is used. Given NFR-1/NFR-3 targets (single file <2s, 100 files <10s) and the fact that `ast.parse` on files up to a few thousand lines is fast, re-parsing on every triggered sync is simpler and avoids cache-invalidation complexity that would otherwise need to track file mtimes/hashes. This can be revisited (see Future Considerations) if file counts grow substantially.
 
 ## 5. API Design
 
-### 5.1 CLI Commands (Command-Line API)
+### 5.1 API Endpoints
+Not applicable — no network/HTTP API exists in this iteration (per the requirements' API Specifications, the only interface is the CLI entry point below).
 
-#### Command: start
-```
-python doc_sync.py start [--config CONFIG_FILE] [--daemon]
+**CLI Interface**
+- **Command**: `python -m src.doc_sync --watch`
+- **Behavior**: Runs an initial full sync of all `.py` files under `src/`, then starts the `watchdog` observer and blocks until `SIGINT` (`Ctrl+C`), at which point it stops the observer and exits with code `0`.
+- **Errors**: Per-file errors never raise to the CLI level (FR-5); only fatal startup errors (e.g. `src/` directory missing) produce a non-zero exit code with a clear stderr message.
 
-Purpose: Start the file watcher and documentation sync service
-
-Options:
-  --config PATH   Path to config.yaml (default: ./config.yaml)
-  --daemon        Run in background (Windows service mode)
-
-Behavior:
-  1. Load configuration
-  2. Initialize components (logger, metrics, file watcher)
-  3. Start file watching on configured directory
-  4. Display startup message with configuration summary
-  5. Enter main event loop
-  6. Process file changes until stopped
-
-Output:
-  Console: Status messages and sync notifications
-  Log file: Detailed operation logs
-  
-Exit Codes:
-  0 - Normal shutdown (Ctrl+C or stop command)
-  1 - Configuration error
-  2 - Permission error
-  3 - Dependency missing
-```
-
-#### Command: stop
-```
-python doc_sync.py stop
-
-Purpose: Gracefully stop the running service
-
-Behavior:
-  1. Send shutdown signal to running process
-  2. Wait for current sync operation to complete
-  3. Save metrics and state
-  4. Clean up resources
-  5. Exit
-
-Output:
-  "Service stopped gracefully"
-  
-Exit Codes:
-  0 - Success
-  1 - No running service found
-```
-
-#### Command: sync
-```
-python doc_sync.py sync [--file FILE_PATH] [--force]
-
-Purpose: Manually trigger documentation sync
-
-Options:
-  --file PATH     Sync only this file (default: all files in src/)
-  --force         Skip review prompts, apply all changes
-
-Behavior:
-  1. Load configuration
-  2. Analyze specified file(s)
-  3. Generate documentation
-  4. Apply changes (with review if needed)
-  5. Commit if git_enabled
-
-Output:
-  Detailed sync results for each file
-  
-Exit Codes:
-  0 - All syncs successful
-  1 - Some syncs failed
-  2 - All syncs failed
-```
-
-#### Command: status
-```
-python doc_sync.py status [--json]
-
-Purpose: Display current status and performance metrics
-
-Options:
-  --json          Output in JSON format
-
-Output:
-  Service Status: Running / Stopped
-  Watching: src/ (15 .py files)
-  
-  Performance Metrics:
-  ├─ Total Operations: 47
-  ├─ Successful: 45 (95.7%)
-  ├─ Failed: 2 (4.3%)
-  ├─ Average Duration: 28.3s
-  └─ Last Sync: 2026-09-01 14:32:15 (2 minutes ago)
-  
-  Recent Operations (last 5):
-  1. [2026-09-01 14:32:15] src/example.py → ✓ (32.1s)
-  2. [2026-09-01 13:15:42] src/config.py → ✓ (25.6s)
-  3. [2026-09-01 12:08:19] src/main.py → ✗ (git error)
-  4. [2026-09-01 11:45:33] src/utils.py → ✓ (19.8s)
-  5. [2026-09-01 10:12:07] src/parser.py → ✓ (41.2s)
-  
-Exit Codes:
-  0 - Always success
-```
-
-#### Command: config
-```
-python doc_sync.py config [--set KEY=VALUE] [--get KEY] [--list]
-
-Purpose: View or update configuration
-
-Options:
-  --set KEY=VALUE Set configuration value
-  --get KEY       Get specific configuration value
-  --list          List all configuration (default)
-
-Examples:
-  python doc_sync.py config --list
-  python doc_sync.py config --get git_enabled
-  python doc_sync.py config --set git_auto_push=true
-
-Output:
-  Configuration values or confirmation of update
-  
-Exit Codes:
-  0 - Success
-  1 - Invalid key or value
-```
-
-### 5.2 Internal API (Python Module Interface)
-
-Components expose clean interfaces for testing and extensibility:
-
-```python
-# File Watcher Service
-class FileWatcherService:
-    def start(self, directory: str, patterns: List[str]) -> None
-    def stop(self) -> None
-    def on_change(self, callback: Callable[[CodeChangeEvent], None]) -> None
-
-# Code Analyzer
-class CodeAnalyzer:
-    def analyze_file(self, file_path: str) -> ParsedCodeStructure
-    def extract_docstring(self, node: ast.AST) -> str
-
-# Doc Generator
-class DocGenerator:
-    def generate_readme_section(self, structure: ParsedCodeStructure, 
-                                 section: str) -> str
-    def generate_api_docs(self, structures: List[ParsedCodeStructure]) -> str
-    def load_template(self, name: str) -> jinja2.Template
-
-# Review Manager
-class ReviewManager:
-    def assess_severity(self, old_doc: str, new_doc: str) -> str
-    def requires_review(self, update: DocumentationUpdate) -> bool
-    def prompt_user_review(self, update: DocumentationUpdate) -> bool
-
-# Documentation Writer
-class DocumentationWriter:
-    def update_sections(self, file_path: str, sections: Dict[str, str]) -> None
-    def create_backup(self, file_path: str) -> str
-    def validate_markdown(self, content: str) -> bool
-
-# Git Manager
-class GitManager:
-    def commit(self, files: List[str], message: str) -> str
-    def push(self, remote: str = "origin") -> bool
-    def handle_conflict(self, file_path: str) -> None
-```
+### 5.2 API Versioning Strategy
+Not applicable — no external API surface to version. The internal Python module functions (`extract_module`, `render_block`, `sync_readme`) are considered internal implementation details, not a versioned public API.
 
 ### 5.3 Error Handling
-
-**Standard Error Response Format (Console):**
-```
-ERROR [component] message
-Details: additional context
-Suggestion: what user should do
-
-Example:
-ERROR [GitManager] Failed to push to remote 'origin'
-Details: Remote rejected push (authentication failed)
-Suggestion: Check Git credentials in environment or run 'git config credential.helper'
-```
-
-**Error Codes:**
-- E001-E099: Configuration errors
-- E100-E199: File system errors
-- E200-E299: Parsing errors
-- E300-E399: Template errors
-- E400-E499: Git errors
-- E500-E599: JIRA errors
-- E600-E699: Validation errors
-- E900-E999: Unknown errors
-
-**Recovery Strategies:**
-- Transient errors (network): Retry with exponential backoff (3 attempts)
-- Validation errors: Rollback changes, alert user
-- Git conflicts: Apply resolution strategy, log outcome
-- Missing files: Log warning, continue monitoring
-- Fatal errors: Shutdown gracefully, preserve state
+- Internal errors are represented by a small typed exception hierarchy (e.g. `DocSyncError` base, `ExtractionError`, `ReadmeSyncError`) so the Sync Orchestrator can catch narrowly and log meaningfully rather than using bare `except Exception`.
+- All caught per-file errors result in a `logging.warning(...)` call including the file path and `str(exception)`, and do not propagate — satisfying FR-5 and NFR-5 (no crash on malformed input).
 
 ## 6. Security Architecture
 
 ### 6.1 Authentication & Authorization
-
-**No User Authentication**: Single-user local application, relies on OS-level authentication.
-
-**Git Authentication:**
-- **Method**: OS Git credential manager or SSH keys
-- **Storage**: Delegates to Git's credential.helper
-- **Token Management**: Environment variable `GIT_TOKEN` or Git credential store
-
-**JIRA Authentication:**
-- **Method**: API token or username/password
-- **Storage**: Environment variables (`JIRA_TOKEN`, `JIRA_USERNAME`, `JIRA_PASSWORD`)
-- **Never stored in**: Config files, code, logs
-
-**Credential Access:**
-- Only GitManager and JIRAClient components can access credentials
-- Credentials are read once at initialization
-- Never passed through other components or logged
+- Not applicable — single-user local process with no network exposure, no login, and no multi-tenant concerns.
 
 ### 6.2 Data Security
-
-**Encryption in Transit:**
-- Git: HTTPS (TLS 1.2+) or SSH
-- JIRA: HTTPS (TLS 1.2+)
-
-**Encryption at Rest:**
-- Not implemented (local filesystem, OS-level encryption if needed)
-- Credentials: OS credential manager (Windows Credential Manager)
-
-**Sensitive Data Handling:**
-- **Secret Detection**: Regex patterns for API keys, tokens, passwords
-- **Sanitization**: Redact before committing
-- **Logging**: Never log credentials or tokens
-- **Patterns Detected**:
-  - API keys: `[A-Za-z0-9]{32,}`
-  - AWS keys: `AKIA[0-9A-Z]{16}`
-  - Private keys: `-----BEGIN.*PRIVATE KEY-----`
-  - Passwords in config: `password\s*[:=]\s*['"](.*?)['"]`
+- **Encryption in Transit**: Not applicable (no network transport).
+- **Encryption at Rest**: Not applicable (relies on the developer's local filesystem/OS-level protections; the tool introduces no additional persistent secrets or credentials).
+- **Sensitive Data**: The tool only reads Python source and docstrings and writes derived text into `README.md`; it introduces no PII handling. Developers are responsible for not putting secrets in docstrings, same as with any documentation tool.
 
 ### 6.3 Security Layers
-
-**Application Security:**
-- **Input Validation**: 
-  - File paths: Prevent directory traversal
-  - Config values: Type checking and bounds
-  - CLI arguments: Sanitize before use
-- **Code Injection Prevention**:
-  - Templates: Jinja2 auto-escaping enabled
-  - AST parsing: Safe, no eval() or exec()
-  - Shell commands: Use GitPython API, not shell=True
-- **File System Safety**:
-  - Atomic writes: temp file + rename
-  - Backups before modifications
-  - Permission checks before writing
-
-**Dependency Security:**
-- Pin versions in requirements.txt
-- Use `pip-audit` to check for vulnerabilities
-- Regular updates for security patches
-
-**Logging Security:**
-- Never log: passwords, tokens, API keys, SSH keys
-- Sanitize: file paths (don't expose username)
-- Audit: All authentication attempts
+- **Network Security**: Not applicable (no listening ports, no outbound calls).
+- **Application Security**:
+  - Source files are only ever parsed via `ast.parse`, never `exec`/`import`ed, eliminating arbitrary code execution risk from scanning untrusted-looking `.py` content (NFR-2).
+  - The Path Validator enforces that any path derived from a filesystem event resolves within the workspace root, preventing path traversal (e.g. via symlinks pointing outside the project) before any file is opened for reading (NFR-2).
+  - Writes are strictly scoped to `README.md`; no other file is ever opened for writing.
+- **API Security**: Not applicable — no API surface.
 
 ### 6.4 Compliance
-
-**Not Applicable**: Solo developer demonstration project, no regulatory requirements.
-
-**Best Practices Followed:**
-- Least privilege: Only access needed resources
-- Secure defaults: Git push disabled by default
-- Audit logging: All operations logged
-- Secret management: Use environment variables
+- Not applicable — the tool processes only source code and documentation text local to the repository; no regulated data categories (PII/PHI/PCI) are in scope.
 
 ## 7. Scalability & Performance
 
 ### 7.1 Scalability Strategy
-
-**Not Applicable - Single User System**
-
-This system is designed for a single developer running locally. Scalability across users or machines is out of scope.
-
-**Local Performance Scalability:**
-- **File Count**: Efficiently handles projects with 100-500 Python files
-- **File Size**: Parses files up to 10,000 lines efficiently
-- **Concurrency**: Single-threaded file watcher, async sync operations
-
-**Limitations:**
-- Very large monorepos (>1000 files): May have slower startup
-- Mitigation: Configurable watch directory to monitor subset
+- **Horizontal Scaling**: Not applicable — single-process, single-machine developer tool by design.
+- **Vertical Scaling**: Naturally benefits from a faster local machine (more CPU for `ast.parse`, faster disk I/O), but no explicit vertical-scaling design is required at this scope.
+- **Auto-scaling**: Not applicable.
 
 ### 7.2 Performance Optimization
-
-**Caching:**
-- Template caching: Jinja2 environment caches compiled templates
-- Code analysis caching: Skip re-parsing unchanged files (hash-based)
-- Configuration caching: Load once at startup
-
-**Efficient File Watching:**
-- Debouncing: Avoid processing rapid successive saves (300ms window)
-- Batching: Group related changes (2-second window)
-- Selective watching: Only .py files in src/ directory
-
-**Asynchronous Processing:**
-- Non-blocking file I/O using asyncio
-- Background sync while watching continues
-- Queue management prevents backlog
-
-**Database Optimization:**
-- **Not Applicable**: No database used
-- Metrics persisted to JSON (lightweight)
-
-**Template Optimization:**
-- Pre-compile templates at startup
-- Minimize template complexity
-- Use template inheritance to avoid duplication
+- **Targeted sync**: Only changed/deleted modules (as reported by the debounced event batch) are re-extracted and re-rendered; unaffected modules' README blocks are left untouched, minimizing per-event work.
+- **Debouncing**: Coalesces rapid successive save events into a single sync pass, avoiding redundant AST parses and README writes (addresses the "rapid successive file-save events" risk).
+- **Atomic, single-pass README write**: The README Sync Writer performs one read and one atomic write per sync pass (not per module), keeping I/O overhead low even when multiple modules changed in the same batch.
 
 ### 7.3 Performance Targets
-
-**From NFR-1 Requirements:**
-
-- **File Change Detection Latency**: < 5 seconds from file save
-  - Target: < 2 seconds (watchdog is very fast)
-  
-- **Documentation Generation Time**: < 2 minutes for typical changes
-  - Target: < 30 seconds for single file
-  
-- **Complete Sync Cycle**: < 5 minutes (detection → commit)
-  - Target: < 3 minutes average
-  
-- **Sync Success Rate**: ≥ 95%
-  - Target: ≥ 98% (fail only on unexpected errors)
-  
-- **CPU Usage (Idle)**: < 5%
-  - Target: < 2% (file watcher is efficient)
-  
-- **Memory Usage**: < 100 MB
-  - Target: < 50 MB for typical projects
-
-**Measurement:**
-- Performance metrics tracked in SyncOperation
-- Reported via `status` command
-- Logged for analysis
+- **Single-file sync pass**: < 2 seconds for files up to 2,000 lines (NFR-1).
+- **Full-project sync pass**: < 10 seconds for up to 100 Python files under `src/` (NFR-3).
+- **Event responsiveness**: No busy-loop polling; reaction to changes is bounded by the debounce window (target: a few hundred milliseconds) plus processing time.
 
 ## 8. Reliability & Availability
 
 ### 8.1 High Availability
-
-**Not Applicable**: Single-user local application, no HA requirements.
-
-**Restart Capability:**
-- Service can be restarted without data loss
-- Metrics persist across restarts
-- No lost file change events (manual sync available)
+- Not applicable in the traditional sense (no uptime SLA, single local process). "Availability" here means the watcher process keeps running across repeated save events without crashing (NFR-5).
+- **Redundancy / Load Balancing**: Not applicable — single process, single machine.
 
 ### 8.2 Disaster Recovery
-
-**RTO (Recovery Time Objective)**: Immediate (restart service)
-
-**RPO (Recovery Point Objective)**: Last committed change
-
-**Backup Strategy:**
-- Documentation backups: Created before each update
-- Metrics: Persisted after each operation
-- Logs: Rotated and preserved
-- Code: Under version control (Git)
-
-**Recovery Procedures:**
-1. If service crashes: Restart with `python doc_sync.py start`
-2. If documentation corrupted: Restore from backup or Git history
-3. If Git issues: Manual Git operations to resolve
-4. If metrics lost: Rebuild from Git history
+- **RTO/RPO**: Not applicable — no persisted service state beyond `README.md`, which is itself version-controlled by the developer's normal Git workflow (providing implicit recovery via `git checkout`/`git diff` if an update is ever unwanted).
+- **Backup Strategy**: Atomic writes (temp file + `os.replace`) ensure `README.md` is never left partially written even if the process is killed mid-write.
+- **Failover Procedures**: Not applicable.
 
 ### 8.3 Fault Tolerance
-
-**Circuit Breakers:**
-- JIRA API: After 3 consecutive failures, disable JIRA integration for 5 minutes
-- Git push: After failure, log and continue (don't block sync)
-
-**Retry Logic:**
-- Git operations: 3 attempts with exponential backoff (1s, 2s, 4s)
-- JIRA API: 3 attempts with exponential backoff
-- File I/O: 2 attempts with 1-second delay
-
-**Graceful Degradation:**
-- JIRA unavailable: Log warning, continue sync without JIRA
-- Git push fails: Commit locally, alert user to push manually
-- Template missing: Use fallback basic template
-- Review prompt fails: Default to requiring review (safe choice)
-
-**Error Isolation:**
-- Each SyncOperation is independent
-- One failure doesn't stop file watching
-- Errors logged but service continues
-
-**Health Checks:**
-- File watcher status: Check observer is alive
-- Disk space: Warn if < 100MB free
-- Git repository: Check repo is valid
-- Configuration: Validate on load
-
-**Self-Healing:**
-- File watcher crash: Automatically restart observer
-- Temp file cleanup: Remove orphaned temp files on startup
-- Lock file cleanup: Remove stale lock files
+- **Circuit Breakers / Retry Logic**: Not required — there are no flaky remote dependencies; local file I/O failures are logged and the affected file is skipped for that pass rather than retried in a loop (avoids masking a persistent problem).
+- **Graceful Degradation**: A single malformed/unreadable file degrades only that module's documentation (left stale with a warning) while all other modules continue to sync normally (FR-5, NFR-5).
+- **Health Checks**: Not applicable to a local CLI process; process liveness is simply whether the terminal session is still running.
 
 ## 9. Monitoring & Observability
 
 ### 9.1 Metrics
-
-**System Metrics:**
-- CPU usage: Monitored by Python `psutil` library (optional)
-- Memory usage: Tracked for performance
-- Disk space: Checked periodically
-
-**Application Metrics:**
-- Sync operations: Total, successful, failed
-- Sync duration: Min, max, average, p95, p99
-- Review rate: Percentage requiring manual review
-- File watch events: Total events detected
-- Component failures: Errors per component
-
-**Business Metrics:**
-- Documentation freshness: Time since last sync
-- Files monitored: Count of .py files in src/
-- Commits generated: Auto-commits per day
-
-**Metrics Collection:**
-- Tracked by MetricsTracker component
-- Persisted to metrics.json
-- Retained: Last 100 operations
+- No metrics backend is used given the tool's local, single-user scope. Effective "metrics" are surfaced directly via log lines: number of files changed per pass, number of sections added/updated/removed, and per-pass duration (optionally logged at `INFO` or `DEBUG` level to help verify NFR-1/NFR-3 targets during development).
 
 ### 9.2 Logging
-
-**Log Levels:**
-- **ERROR**: Failures, exceptions, critical issues
-- **WARN**: Potential issues, degraded operation
-- **INFO**: Normal operations, sync completions
-- **DEBUG**: Detailed traces, internal state (disabled by default)
-
-**Log Format:**
-```
-[YYYY-MM-DD HH:MM:SS.mmm] [LEVEL] [Component] Message
-Context: {key: value}
-
-Example:
-[2026-09-01 14:32:15.234] [INFO] [SyncOrchestrator] Sync operation completed
-Context: {operation_id: "abc-123", duration: 32.1, files: 1, status: "success"}
-```
-
-**Log Aggregation:**
-- Single log file: doc_sync.log
-- Rotation: 10 MB per file, keep 5 backups
-- Location: Configurable, default project root
-
-**Log Retention:**
-- 5 rotated files = ~50MB total
-- Equivalent to ~1-2 weeks of operation
-
-**What is Logged:**
-- All sync operations (start, end, duration, status)
-- File changes detected
-- Documentation updates applied
-- Git commits created
-- JIRA comments added
-- Errors and stack traces
-- Configuration changes
-- User interactions (review prompts)
-
-**What is NOT Logged:**
-- Credentials or tokens
-- File content (only paths and hashes)
-- Personal information
+- **Log Levels**: `INFO` for pass start/end and section-level changes; `WARNING` for per-file skips/failures; `ERROR` reserved for fatal startup conditions (e.g. `src/` missing).
+- **Log Format**: Plain text, single-line, human-readable (e.g. `2026-09-03 10:00:00 INFO Sync pass: 2 files changed, 1 section updated`), matching NFR-4's requirement for clear console output — structured JSON logging is unnecessary overhead for a local console tool.
+- **Log Aggregation**: Not applicable — output goes to the developer's terminal (stdout/stderr) only.
+- **Retention**: Not applicable — no persisted logs beyond terminal scrollback.
 
 ### 9.3 Alerting
-
-**Alert Channels:**
-- Console: Immediate notifications during operation
-- Log file: All events for later review
-- (Optional) Email: Not implemented in v1
-
-**Alert Conditions:**
-- **Critical**:
-  - Service crash or unexpected shutdown
-  - Git commit failed repeatedly
-  - Documentation corruption detected
-- **Warning**:
-  - Sync failure (single operation)
-  - JIRA API unavailable
-  - Disk space < 100MB
-  - Review required (user prompt)
-- **Info**:
-  - Sync completed successfully
-  - Configuration reloaded
-
-**Alert Format (Console):**
-```
-⚠ WARNING: Git push failed (authentication error)
-✓ SUCCESS: Documentation synced for src/example.py
-✗ ERROR: Failed to parse src/broken.py (syntax error)
-⟳ REVIEW: Major documentation change requires approval
-```
-
-**On-Call Rotation:**
-- Not applicable (solo developer)
+- Not applicable — no on-call rotation or alert channel; the developer directly observes console warnings in real time.
 
 ### 9.4 Distributed Tracing
-
-**Not Applicable**: Monolithic single-process application, no distributed components.
-
-**Operation Tracing:**
-- Each SyncOperation has unique ID (UUID)
-- All logs for an operation include operation_id
-- Can trace flow through components via ID
+- Not applicable — single in-process pipeline with no distributed calls.
 
 ## 10. Key Design Decisions
 
-### Decision 1: Monolithic vs. Microservices Architecture
+### Decision 1: Marker-block replacement strategy for README.md
+- **Context**: FR-3/FR-4 require preserving hand-written README content while keeping auto-generated sections in sync, and must support safe removal on module/function deletion.
+- **Options Considered**:
+  1. Regenerate the entire `README.md` from a template each pass — simple, but destroys any hand-written content (violates FR-3).
+  2. HTML-comment marker pairs (`<!-- AUTO-DOC:START module=X -->...END-->`) scoped per module — precise, preserves surrounding content, human-readable in raw Markdown.
+  3. A separate `docs/*.md` file per module — avoids touching `README.md` at all, but explicitly out of scope per requirements.
+- **Decision**: Option 2 — per-module HTML comment marker pairs.
+- **Rationale**: Directly matches the requirement's specified marker format, keeps the diff surface minimal (only the changed module's block changes), and supports precise removal (FR-4) by deleting the whole marker pair.
+- **Consequences**: The README Sync Writer must defensively validate marker pairing/uniqueness (risk noted in requirements) and skip-with-warning on malformed markers rather than guessing.
+- **Related Requirements**: FR-3, FR-4.
 
-**Context**: Need to decide overall architecture pattern for the system.
+### Decision 2: Debounced, event-driven watcher instead of polling
+- **Context**: NFR-1 explicitly forbids busy-loop/polling; FR-1 requires reacting to create/modify/delete events.
+- **Options Considered**:
+  1. Polling loop that periodically re-scans `src/` for mtime changes — simple but violates NFR-1 and wastes CPU.
+  2. `watchdog` OS-level event API with an in-process debounce buffer.
+  3. `watchdog` with no debounce — reacts to every raw event, risking redundant syncs on autosave bursts.
+- **Decision**: Option 2 — `watchdog` events plus a short in-process debounce window.
+- **Rationale**: Satisfies NFR-1 (event-driven, no polling) while mitigating the "rapid successive save events" risk called out in the requirements.
+- **Consequences**: Introduces a small fixed latency (the debounce window) before a sync pass runs; acceptable given the 2-second NFR-1 budget still leaves ample headroom.
+- **Related Requirements**: FR-1, NFR-1, Risks section.
 
-**Options Considered:**
-1. **Monolithic Python Application**
-   - **Pros**: Simple deployment, easy debugging, no network overhead, suitable for solo developer
-   - **Cons**: Less scalable, components tightly coupled
-   
-2. **Microservices (File Watcher, Doc Generator, Git Service)**
-   - **Pros**: Scalable, independent deployment, polyglot
-   - **Cons**: Complex for single user, network overhead, harder to debug, over-engineered
-   
-3. **Serverless Functions (Lambda/Azure Functions)**
-   - **Pros**: Auto-scaling, pay-per-use
-   - **Cons**: Requires cloud, cold starts, complex state management, violates local-only constraint
+### Decision 3: `ast`-only parsing, never `exec`/`import`
+- **Context**: NFR-2 mandates the tool must not execute or import scanned source files.
+- **Options Considered**:
+  1. `importlib` + `inspect` to introspect live modules — richer runtime info but executes arbitrary code, a security risk (violates NFR-2).
+  2. `ast.parse` static analysis — no execution, slightly more manual work to render signatures/docstrings.
+- **Decision**: Option 2 — pure `ast` static parsing.
+- **Rationale**: Directly required by NFR-2; also inherently safer for a tool that reacts automatically to filesystem changes without human review before parsing.
+- **Consequences**: Cannot resolve runtime-computed defaults or dynamically generated functions — acceptable given FR-2's explicit scope (module-level `def`s only, no dynamic introspection required).
+- **Related Requirements**: FR-2, NFR-2.
 
-**Decision**: Monolithic Python Application
+### Decision 4: Sequential, single-process pipeline (no async/multiprocessing)
+- **Context**: The tool must meet modest performance targets (NFR-1: 2s/file, NFR-3: 10s/100 files) without introducing operational complexity.
+- **Options Considered**:
+  1. Sequential processing in the main thread/process — simplest to reason about and debug.
+  2. `multiprocessing` pool to parse files in parallel — faster for large file counts, but adds complexity (IPC, pickling `ModuleInfo`) disproportionate to the stated scale.
+  3. `asyncio` with async file I/O — file I/O and `ast.parse` are CPU/sync-bound, so async offers little benefit here.
+- **Decision**: Option 1 — sequential processing.
+- **Rationale**: At ≤100 files with a 10-second budget, sequential `ast.parse` calls comfortably meet the target on typical developer hardware; added concurrency would increase complexity without clear necessity.
+- **Consequences**: If the project scale grows far beyond 100 files, a future revision could introduce a process pool (see Future Considerations).
+- **Related Requirements**: NFR-1, NFR-3.
 
-**Rationale**:
-- Single-user local execution (no scale requirements)
-- Demonstration focus requires simplicity and clarity
-- Easier to understand, test, and debug
-- No network latency between components
-- Matches Python ecosystem conventions
-- Deployment is trivial (single script)
-
-**Consequences**:
-- Cannot scale horizontally (not needed)
-- All components share same process (tight coupling acceptable for this use case)
-- Simpler testing and demonstration
-- Faster development cycle
-
-**Related Requirements**: All constraints (local Windows, solo developer, demonstration)
-
-### Decision 2: Event-Driven vs. Polling for File Watching
-
-**Context**: How to detect file changes in the src/ directory.
-
-**Options Considered:**
-1. **Event-Driven (watchdog library)**
-   - **Pros**: Immediate detection, low CPU, efficient, industry standard
-   - **Cons**: Requires library, platform differences
-   
-2. **Polling (check periodically)**
-   - **Pros**: Simple, no dependencies
-   - **Cons**: High CPU, delayed detection, inefficient
-   
-3. **Git Hooks (pre-commit)**
-   - **Pros**: Integrated with Git workflow
-   - **Cons**: Requires manual setup, only triggers on commit, misses intermediate changes
-
-**Decision**: Event-Driven with watchdog library
-
-**Rationale**:
-- Meets performance requirement (< 5 seconds detection)
-- Minimal CPU overhead (< 5% idle)
-- Watchdog is mature, well-tested on Windows
-- Real-time detection better than polling delay
-- Industry standard approach
-
-**Consequences**:
-- Dependency on watchdog library
-- Must handle platform differences (watchdog abstracts this)
-- Excellent performance characteristics
-
-**Related Requirements**: FR-1, NFR-1 (Performance)
-
-### Decision 3: Template-Based vs. AI-Generated Documentation
-
-**Context**: How to generate documentation content from code.
-
-**Options Considered:**
-1. **Template-Based (Jinja2)**
-   - **Pros**: Predictable, fast, no API costs, works offline, customizable
-   - **Cons**: Less intelligent, requires template maintenance
-   
-2. **AI/LLM (OpenAI, Claude)**
-   - **Pros**: Intelligent, context-aware, natural language
-   - **Cons**: API costs, latency, requires internet, less predictable
-   
-3. **Hybrid (Templates + AI enhancement)**
-   - **Pros**: Best of both worlds
-   - **Cons**: Complex, costly, over-engineered for demo
-
-**Decision**: Template-Based with Jinja2
-
-**Rationale**:
-- Requirement explicitly specifies template-based (stakeholder preference)
-- Works offline (local development)
-- No API costs or rate limits
-- Fast and predictable
-- Easier to demonstrate and understand
-- Sufficient for Python code with docstrings
-- Templates can be customized by user
-
-**Consequences**:
-- Documentation quality depends on template design
-- Requires well-structured code with docstrings
-- No advanced natural language generation
-- Templates need initial setup
-
-**Related Requirements**: FR-2 (Template-Based Documentation Generation)
-
-### Decision 4: Synchronous vs. Asynchronous Processing
-
-**Context**: How to process sync operations while continuing to watch files.
-
-**Options Considered:**
-1. **Fully Synchronous (Single-threaded)**
-   - **Pros**: Simple, no concurrency issues
-   - **Cons**: Blocks file watching during sync, poor UX
-   
-2. **Threading (concurrent.futures)**
-   - **Pros**: True parallelism, familiar pattern
-   - **Cons**: GIL limitations, complex error handling, shared state issues
-   
-3. **Async/Await (asyncio)**
-   - **Pros**: Efficient I/O, cooperative multitasking, Pythonic
-   - **Cons**: Requires async-aware libraries
-
-**Decision**: Hybrid - Async I/O with asyncio
-
-**Rationale**:
-- File watching continues while sync operations run
-- Async is ideal for I/O-bound operations (file, network)
-- Python 3.9+ has mature asyncio support
-- Better resource utilization than threads
-- Cooperative multitasking avoids race conditions
-- Can batch multiple changes efficiently
-
-**Consequences**:
-- Must use async-compatible libraries or run_in_executor for sync code
-- Slightly more complex code structure
-- Excellent performance and responsiveness
-
-**Related Requirements**: NFR-1 (Performance - non-blocking), NFR-4 (Usability)
-
-### Decision 5: Conditional Review vs. Always Manual vs. Fully Automated
-
-**Context**: When should documentation changes require human approval?
-
-**Options Considered:**
-1. **Always Manual Review**
-   - **Pros**: Maximum safety, human oversight
-   - **Cons**: Tedious, slows workflow, defeats automation purpose
-   
-2. **Fully Automated (No Review)**
-   - **Pros**: Fastest, true automation
-   - **Cons**: Risk of errors, bad documentation committed
-   
-3. **Conditional (Severity-Based)**
-   - **Pros**: Balances automation and safety
-   - **Cons**: Requires severity assessment logic
-
-**Decision**: Conditional Review Based on Severity
-
-**Rationale**:
-- Requirement specifies conditional review (FR-5)
-- Minor changes (typo fixes, small additions) don't need review
-- Major changes (structural, critical sections) need review
-- Balances automation efficiency with quality control
-- User maintains oversight on important changes
-- Configurable threshold (50 lines default)
-
-**Consequences**:
-- Requires severity assessment logic (line count, structure analysis)
-- Some operations require user interaction
-- Must handle review prompts gracefully
-- Good balance for demonstration
-
-**Related Requirements**: FR-5 (Conditional Review Workflow)
-
-### Decision 6: Git Commit Strategy - Auto vs. Manual vs. Staged
-
-**Context**: How to handle committing documentation changes to Git.
-
-**Options Considered:**
-1. **Auto-Commit and Push**
-   - **Pros**: Fully automated, immediate sync
-   - **Cons**: May pollute Git history, risky if push fails
-   
-2. **Auto-Commit, Manual Push**
-   - **Pros**: Safe, preserves local changes, user control
-   - **Cons**: Requires manual step
-   
-3. **Stage Only, Manual Commit**
-   - **Pros**: Maximum user control
-   - **Cons**: Defeats automation purpose
-
-**Decision**: Auto-Commit Locally, Optional Auto-Push (Default: Disabled)
-
-**Rationale**:
-- Commits provide audit trail and versioning
-- Local commits are safe (can amend or revert)
-- Auto-push disabled by default for safety
-- User can enable auto-push if desired
-- Separate commits for each sync operation (clear history)
-- Commits tagged as [automated] for clarity
-
-**Consequences**:
-- Git history includes automated commits
-- User can review commits before pushing
-- Must handle commit failures gracefully
-- Push failures don't break sync workflow
-
-**Related Requirements**: FR-6 (Version Control Integration)
-
-### Decision 7: In-Memory State vs. Database for Metrics
-
-**Context**: How to persist sync operation metrics and history.
-
-**Options Considered:**
-1. **SQLite Database**
-   - **Pros**: Structured queries, relational data, mature
-   - **Cons**: Overkill for simple metrics, adds dependency
-   
-2. **JSON File**
-   - **Pros**: Simple, human-readable, no dependencies
-   - **Cons**: Limited query capability, load entire file
-   
-3. **No Persistence (In-Memory Only)**
-   - **Pros**: Simplest
-   - **Cons**: Lose metrics on restart
-
-**Decision**: JSON File with In-Memory Cache
-
-**Rationale**:
-- Simple metrics (counts, averages) don't need SQL
-- JSON is human-readable and debuggable
-- Python json module is built-in
-- Persist after each operation (durability)
-- Load into memory at startup (fast queries)
-- Retain last 100 operations (bounded size)
-- Suitable for single-user demonstration
-
-**Consequences**:
-- Limited to simple queries (recent operations, averages)
-- File I/O on each update (acceptable for infrequent operations)
-- Manual file editing possible if needed
-- ~10KB file size (very lightweight)
-
-**Related Requirements**: NFR-1 (Performance metrics), Success Criteria
-
-### Decision 8: Secrets Management Strategy
-
-**Context**: How to securely handle Git and JIRA credentials.
-
-**Options Considered:**
-1. **Config File (YAML)**
-   - **Pros**: Simple, centralized
-   - **Cons**: Insecure, credentials in plaintext
-   
-2. **Environment Variables**
-   - **Pros**: Standard practice, no file storage, OS-level protection
-   - **Cons**: Must set before running, less convenient
-   
-3. **Windows Credential Manager**
-   - **Pros**: Secure OS storage, encrypted
-   - **Cons**: Platform-specific, requires additional library
-   
-4. **Hybrid (Env Vars + Credential Manager)**
-   - **Pros**: Flexibility
-   - **Cons**: More complex
-
-**Decision**: Environment Variables (Primary) with Git Credential Helper (Fallback)
-
-**Rationale**:
-- Environment variables are standard for credentials
-- No plaintext in config files or code
-- Git already has credential.helper system
-- JIRA credentials via JIRA_TOKEN env var
-- Simple and secure
-- Documented in README setup instructions
-- Meets security requirements (NFR-2)
-
-**Consequences**:
-- User must set environment variables
-- Clear documentation needed in README
-- No credential storage in code or config
-- Credentials never logged
-
-**Related Requirements**: NFR-2 (Security)
+### Decision 5: Atomic file writes for README.md
+- **Context**: NFR-5 requires the tool never crash or corrupt state across repeated events; a crash mid-write to `README.md` would corrupt the file.
+- **Options Considered**:
+  1. Direct in-place write (`open(path, "w")` then write) — simplest, but a crash mid-write leaves a truncated/corrupted file.
+  2. Write to a temp file in the same directory, then `os.replace()` onto `README.md` — atomic on POSIX and Windows (same-volume rename).
+- **Decision**: Option 2 — temp file + atomic replace.
+- **Rationale**: Guarantees `README.md` is always either fully the old version or fully the new version, never partially written, protecting the developer's hand-written content.
+- **Consequences**: Slightly more I/O code (temp file creation/cleanup) but negligible performance cost.
+- **Related Requirements**: NFR-5, FR-3.
 
 ## 11. Deployment Architecture
 
 ### 11.1 Environments
-
-**Single Environment: Local Development**
-
-- **Purpose**: Solo developer's local Windows machine
-- **Configuration**: config.yaml in project root
-- **Deployment**: Manual (git clone + pip install)
-
-**No Staging or Production**: This is a local demonstration project, not a deployed service.
+- **Development**: The only environment — this tool runs directly on a developer's local machine against their working copy of the repository. No staging/production environments apply, per the requirement's explicit "runs locally on a developer machine (not inside CI)" assumption.
 
 ### 11.2 Deployment Strategy
-
-**Installation:**
-```bash
-# 1. Clone repository
-git clone <repository-url>
-cd doc-sync-project
-
-# 2. Create virtual environment
-python -m venv venv
-venv\Scripts\activate
-
-# 3. Install dependencies
-pip install -r requirements.txt
-
-# 4. Configure
-copy config.example.yaml config.yaml
-# Edit config.yaml with project-specific paths
-
-# 5. Set credentials (environment variables)
-setx GIT_TOKEN "your-git-token"
-setx JIRA_TOKEN "your-jira-token"
-
-# 6. Run
-python doc_sync.py start
-```
-
-**Update Strategy:**
-```bash
-git pull origin main
-pip install --upgrade -r requirements.txt
-python doc_sync.py stop
-python doc_sync.py start
-```
-
-**Rollback Strategy:**
-```bash
-git checkout <previous-commit>
-pip install -r requirements.txt
-python doc_sync.py start
-```
-
-**Database Migrations:**
-- Not applicable (no database)
-- Configuration schema changes: Manual config.yaml update
+- **Deployment Method**: None required — the tool is invoked directly via `python -m src.doc_sync --watch` from the repo checkout; there is no packaging/release pipeline in this iteration.
+- **Rollback Strategy**: Standard Git workflow — if an auto-generated README change is unwanted, the developer can `git diff`/`git checkout -- README.md` like any other local change.
+- **Database Migrations**: Not applicable (no database).
 
 ### 11.3 Infrastructure as Code
-
-**Not Applicable**: Local execution, no cloud infrastructure.
-
-**Configuration as Code:**
-- config.yaml: Application configuration
-- requirements.txt: Python dependencies
-- templates/: Documentation templates
-- All version-controlled in Git
+- Not applicable — no cloud infrastructure is provisioned.
 
 ## 12. Development Guidelines
 
 ### 12.1 Code Organization
-
-**Project Structure:**
-```
-doc-sync-project/
-├── doc_sync.py              # Main CLI entry point
-├── config.yaml              # Configuration file
-├── config.example.yaml      # Template configuration
-├── requirements.txt         # Python dependencies
-├── README.md                # User documentation
-├── LICENSE                  # License file
-│
-├── src/                     # User's code (watched)
-│   ├── __init__.py
-│   └── ...                  # User's Python modules
-│
-├── doc_sync/                # Application package
-│   ├── __init__.py
-│   ├── core/                # Core components
-│   │   ├── __init__.py
-│   │   ├── orchestrator.py  # SyncOrchestrator
-│   │   └── models.py        # Data models (dataclasses)
-│   │
-│   ├── watchers/            # File watching
-│   │   ├── __init__.py
-│   │   └── file_watcher.py  # FileWatcherService
-│   │
-│   ├── analyzers/           # Code analysis
-│   │   ├── __init__.py
-│   │   └── code_analyzer.py # CodeAnalyzer
-│   │
-│   ├── generators/          # Documentation generation
-│   │   ├── __init__.py
-│   │   ├── doc_generator.py # DocGenerator
-│   │   └── templates/       # Jinja2 templates
-│   │       ├── readme_api.j2
-│   │       ├── readme_config.j2
-│   │       └── api_doc.j2
-│   │
-│   ├── writers/             # Documentation writing
-│   │   ├── __init__.py
-│   │   └── doc_writer.py    # DocumentationWriter
-│   │
-│   ├── reviewers/           # Review management
-│   │   ├── __init__.py
-│   │   └── review_manager.py# ReviewManager
-│   │
-│   ├── integrations/        # External integrations
-│   │   ├── __init__.py
-│   │   ├── git_manager.py   # GitManager
-│   │   ├── jira_client.py   # JIRAClient
-│   │   └── secret_detector.py# SecretDetector
-│   │
-│   ├── utils/               # Utilities
-│   │   ├── __init__.py
-│   │   ├── config.py        # ConfigManager
-│   │   ├── logger.py        # Logger setup
-│   │   └── metrics.py       # MetricsTracker
-│   │
-│   └── cli/                 # CLI interface
-│       ├── __init__.py
-│       └── commands.py      # Command handlers
-│
-├── tests/                   # Test suite
-│   ├── __init__.py
-│   ├── unit/                # Unit tests
-│   │   ├── test_analyzer.py
-│   │   ├── test_generator.py
-│   │   └── ...
-│   ├── integration/         # Integration tests
-│   │   ├── test_sync_flow.py
-│   │   └── ...
-│   └── fixtures/            # Test fixtures
-│       ├── sample_code.py
-│       └── expected_docs.md
-│
-├── templates/               # User-editable templates
-│   ├── readme_api.j2
-│   ├── readme_config.j2
-│   └── api_doc.j2
-│
-├── docs/                    # Project documentation
-│   ├── API.md               # Generated API docs (example)
-│   └── ARCHITECTURE.md      # This document
-│
-├── logs/                    # Log files (gitignored)
-│   └── doc_sync.log
-│
-└── metrics.json             # Performance metrics (gitignored)
-```
-
-**Module Boundaries:**
-- Each subdirectory is a logical module with `__init__.py`
-- Single Responsibility: Each module has one primary purpose
-- Dependency Direction: Core → Utils, Generators → Analyzers, Orchestrator → All
-- No circular dependencies
-
-**Dependency Management:**
-- requirements.txt for production dependencies
-- requirements-dev.txt for development tools (pytest, black, pylint)
-- Use `pip freeze` to lock versions
+- **Project Structure**:
+  ```
+  src/
+    doc_sync.py        # CLI entry point (argparse, wiring) OR package: src/doc_sync/
+                        #   __main__.py     - CLI entry point
+                        #   watcher.py      - File Watcher + Event Debouncer
+                        #   orchestrator.py - Sync Orchestrator
+                        #   extractor.py    - AST Extractor (ModuleInfo/FunctionInfo)
+                        #   renderer.py     - Markdown Renderer
+                        #   readme_writer.py- README Sync Writer (marker parsing/patching)
+                        #   errors.py       - DocSyncError hierarchy
+  tests/
+    test_doc_sync.py   # unit/integration tests per verification phase
+  README.md
+  ```
+  A single-file `src/doc_sync.py` is acceptable for this scope; splitting into a small `src/doc_sync/` package (as sketched above) is preferred once the implementation grows past a few hundred lines, to keep each component's responsibility (per Section 2.3) independently testable.
+- **Module Boundaries**: Each component in Section 2.3 maps to one internal module with a narrow, pure-function-style public interface (e.g. `extract_module`, `render_block`, `sync_readme`), keeping the AST Extractor and Markdown Renderer free of filesystem side effects so they can be unit tested with in-memory strings.
+- **Dependency Management**: Declared in `requirements.txt` (already present in the repo); only new dependency is `watchdog`.
 
 ### 12.2 Development Workflow
-
-**Branching Strategy**: Simple GitHub Flow (for demonstration)
-
-- `main`: Stable, working code
-- `feature/feature-name`: New features
-- `fix/bug-description`: Bug fixes
-- `docs/update-description`: Documentation updates
-
-**Workflow:**
-1. Create feature branch from `main`
-2. Develop and test locally
-3. Run tests: `pytest`
-4. Run linter: `pylint doc_sync/`
-5. Format code: `black doc_sync/`
-6. Commit with descriptive messages
-7. Push branch
-8. Create pull request (if team collaboration)
-9. Merge to `main` after review
-
-**Code Review:**
-- Self-review for solo developer
-- Checklist:
-  - [ ] Tests pass
-  - [ ] Code formatted (black)
-  - [ ] Linter passes (pylint)
-  - [ ] Docstrings added
-  - [ ] No secrets committed
-  - [ ] README updated if needed
-
-**Testing Requirements:**
-- Unit tests: ≥ 70% coverage for core functionality
-- Integration tests: Key workflows (file change → doc update → commit)
-- Manual testing: Run full sync cycle before release
+- **Branching Strategy**: Standard trunk-based or feature-branch workflow per existing repo conventions (not redefined here).
+- **Code Review**: Handled by the pipeline's `code_review` phase (per the orchestrator's phase sequence) — architecture does not need to redefine this.
+- **Testing Requirements**: Unit tests for the AST Extractor (signature/docstring extraction edge cases), the Markdown Renderer (idempotent output), and the README Sync Writer (marker insert/replace/remove, malformed-marker handling); an integration test simulating a full watch-trigger-sync cycle without requiring real filesystem events (e.g. by invoking the Sync Orchestrator directly with a synthetic change set).
 
 ### 12.3 Documentation Requirements
+- **API Documentation**: Not applicable (no network API); the CLI's `--help` output (via `argparse`) documents usage.
+- **Code Documentation**: Each extracted-facing function should have a docstring consistent with what the tool itself expects to parse (dogfooding), but this is not a hard architectural requirement.
+- **Architecture Decision Records**: Captured inline in Section 10 of this document; no separate ADR directory is introduced given the project's small scope.
 
-**Code Documentation:**
-- All modules: Module-level docstring explaining purpose
-- All classes: Class docstring with attributes and purpose
-- All public functions: Docstring with parameters, return value, raises
-- Complex logic: Inline comments explaining "why", not "what"
-
-**Docstring Format**: Google Style
-```python
-def generate_readme_section(self, structure: ParsedCodeStructure, section: str) -> str:
-    """Generate a README section from parsed code structure.
-    
-    Args:
-        structure: Parsed code structure from CodeAnalyzer
-        section: Section name ('api' or 'config')
-        
-    Returns:
-        Generated Markdown content for the section
-        
-    Raises:
-        TemplateNotFoundError: If template file doesn't exist
-        GenerationError: If template rendering fails
-    """
-```
-
-**API Documentation:**
-- Maintained in docs/API.md (auto-generated by the system itself!)
-- Documents all public classes and functions
-- Includes usage examples
-
-**Architecture Decision Records:**
-- Section 10 of this document serves as ADR
-- Update when major decisions change
-
-**README.md:**
-- Installation instructions
-- Configuration guide
-- Usage examples
-- Troubleshooting
-
-## 13. Migration Strategy
-
-**Not Applicable**: This is a new system, not replacing an existing one.
-
-**Onboarding Strategy (for user adopting the system):**
-1. Install dependencies
-2. Configure config.yaml for their project
-3. Run initial manual sync to bootstrap documentation
-4. Start automated watching
+## 13. Migration Strategy (If Applicable)
+Not applicable — this is a new tool being added to the repository, not a replacement for an existing system. The only "migration" concern is the first full sync pass on startup, which will insert new marker blocks into the existing `README.md` without disturbing current hand-written content (handled by the README Sync Writer's append-if-missing behavior).
 
 ## 14. Risks & Mitigations
 
-### Risk 1: Template Complexity (From Requirements)
+### Risk 1: Marker corruption from manual edits or duplication
 - **Probability**: Medium
-- **Impact**: High (core functionality)
-- **Mitigation**: 
-  - Start with simple templates
-  - Use Python AST for reliable parsing (not regex)
-  - Include template testing in test suite
-  - Provide template examples
-- **Contingency**: Fallback to basic format if template fails
-- **Status**: Addressed in design with CodeAnalyzer and template structure
-
-### Risk 2: File Watcher Performance on Windows (From Requirements)
-- **Probability**: Low
 - **Impact**: Medium
-- **Mitigation**: 
-  - Use watchdog library (proven on Windows)
-  - Implement debouncing (300ms)
-  - Batch changes (2-second window)
-  - Monitor CPU/memory usage
-- **Contingency**: Fallback to polling if watchdog fails
-- **Status**: Addressed with watchdog + debouncing strategy
+- **Mitigation**: README Sync Writer validates marker pairing/uniqueness per module before patching; malformed markers cause that module's update to be skipped with a logged warning rather than an unpredictable rewrite.
+- **Contingency**: Since `README.md` is version-controlled, a developer can manually fix or remove the malformed markers and let the next sync pass re-insert a clean block.
 
-### Risk 3: Secret Exposure (From Requirements)
+### Risk 2: Redundant sync passes from rapid successive save events
+- **Probability**: High (common with editor autosave)
+- **Impact**: Low (wasted CPU/log noise, not correctness)
+- **Mitigation**: Event Debouncer coalesces events within a short window before triggering a sync pass.
+- **Contingency**: If debounce window proves too short/long in practice, it is a single configurable constant to tune.
+
+### Risk 3: Large/unwieldy docstrings or signatures degrading README readability
 - **Probability**: Medium
-- **Impact**: High (security)
-- **Mitigation**: 
-  - SecretDetector component with regex patterns
-  - Scan before commit
-  - Manual review for major changes
-  - Never log credentials
-- **Contingency**: Git history rewriting if secret committed
-- **Status**: Addressed with SecretDetector and security architecture
-
-### Risk 4: Git Conflicts in Documentation
-- **Probability**: Low (solo developer)
 - **Impact**: Low
-- **Mitigation**: 
-  - Code takes precedence strategy
-  - Automated conflict resolution
-  - Backups before changes
-  - Can manually revert via Git
-- **Contingency**: Manual resolution instructions in documentation
-- **Status**: Addressed in GitManager design
+- **Mitigation**: Signatures are rendered as single-line code spans; docstrings are preserved verbatim without extra formatting logic, per requirements' explicit mitigation.
+- **Contingency**: None needed beyond developer discipline in writing reasonably-sized docstrings; out of scope to auto-truncate.
 
-### Risk 5: Dependencies Breaking
+### Risk 4: Path traversal via crafted/symlinked paths in watcher events
 - **Probability**: Low
-- **Impact**: Medium
-- **Mitigation**: 
-  - Pin versions in requirements.txt
-  - Test before updating dependencies
-  - Document compatible versions
-- **Contingency**: Rollback to previous working versions
-- **Status**: requirements.txt with pinned versions
+- **Impact**: High (could read/write outside the project)
+- **Mitigation**: Path Validator resolves and checks every candidate path against the workspace root before any open() call (NFR-2).
+- **Contingency**: Any rejected path is logged as a warning and simply skipped; no file operation occurs.
 
-### Risk 6: User Adoption Difficulty
+### Risk 5: Process interrupted mid-write corrupting README.md
 - **Probability**: Low
-- **Impact**: Medium (demonstration goal)
-- **Mitigation**: 
-  - Comprehensive README with step-by-step setup
-  - Sensible defaults in config
-  - Clear error messages with suggestions
-  - Example templates included
-- **Contingency**: Create video walkthrough if needed
-- **Status**: Addressed with usability focus in design
+- **Impact**: High (would corrupt the developer's documentation file)
+- **Mitigation**: Atomic writes via temp file + `os.replace()` (Decision 5).
+- **Contingency**: Git version history provides a recovery path even in the unlikely event of an unexpected write failure.
 
 ## 15. Open Questions
-
-1. **Template Format Details**: What specific information should API documentation include? (Function signatures, parameters, examples, etc.)
-   - **Resolution Path**: Define during implementation based on user needs
-
-2. **Review Interface**: Should review prompts be console-based or open a text editor?
-   - **Proposed**: Console-based for simplicity (y/n prompt with diff preview)
-
-3. **Metrics Visualization**: Should there be a graphical view of metrics?
-   - **Proposed**: Not in v1, status command is sufficient for demonstration
-
-4. **Multiple Projects**: Should one service instance handle multiple projects?
-   - **Proposed**: No, one instance per project (keep it simple)
-
-5. **Error Notification**: Should errors send desktop notifications?
-   - **Proposed**: Not in v1, console + log is sufficient
+- Should the debounce window and full-vs-targeted sync thresholds be hardcoded constants or exposed as optional CLI flags? (Architecture allows either; recommend starting with hardcoded sensible defaults and revisiting during implementation if needed.)
+- Exact placement rule when no `## API Reference` heading exists and the file has other trailing sections (e.g., a `## License` at the very end) — recommend appending new blocks immediately before the first existing `<!-- AUTO-DOC:START -->` block if any exist, otherwise at end of file; to be finalized during implementation planning.
 
 ## 16. Future Considerations
-
-**Phase 2 Enhancements (Out of scope for v1):**
-
-1. **AI-Enhanced Generation**: Integrate LLM for more intelligent documentation
-2. **Web Dashboard**: Browser-based UI for status, metrics, and configuration
-3. **Multi-Language Support**: Extend beyond Python (JavaScript, Java, etc.)
-4. **ReadTheDocs Integration**: Auto-publish documentation to hosting platforms
-5. **Advanced Templates**: Visual template editor, template marketplace
-6. **Team Features**: Multi-user support, collaborative review workflow
-7. **CI/CD Integration**: GitHub Actions plugin for automated docs in PR checks
-8. **Documentation Quality Scoring**: Analyze documentation completeness and quality
-9. **Custom Hooks**: Plugin system for user-defined processing steps
-10. **Real-Time Preview**: Live documentation preview as you code
-
-**Architectural Considerations for Future:**
-- Plugin architecture for extensibility
-- Web API for remote control
-- Database for multi-user state
-- Microservices for scaling to teams
+- Parallelizing AST extraction (e.g. `multiprocessing.Pool`) if the project's file count grows well beyond the 100-file NFR-3 target.
+- Optional support for class/method documentation extraction, explicitly out of scope for this iteration.
+- Optional CI integration (e.g. a "check mode" that fails if README.md would differ from a fresh sync), explicitly out of scope for this iteration but architecturally compatible since the Sync Orchestrator/Renderer/Writer are pure enough to run in a "dry-run diff" mode without code changes to their core logic.
 
 ## 17. Appendix
 
 ### 17.1 Glossary
-
-- **AST**: Abstract Syntax Tree - parsed representation of Python code
-- **Debouncing**: Delaying action until a pause in events (avoid processing rapid changes)
-- **Batching**: Grouping multiple related events for efficient processing
-- **Docstring**: Documentation string in Python code ("""...""")
-- **Jinja2**: Python template engine for generating text/markup
-- **GitPython**: Python library for Git operations
-- **Watchdog**: Python library for file system event monitoring
-- **Sync Operation**: End-to-end process from file change to documentation commit
-- **Review Severity**: Classification of documentation change impact (minor, moderate, major)
-- **Secret Detector**: Component that scans for credentials in documentation
-- **CLI**: Command-Line Interface
-- **NFR**: Non-Functional Requirement
-- **FR**: Functional Requirement
-- **RTO**: Recovery Time Objective
-- **RPO**: Recovery Point Objective
+- **Marker block**: A pair of HTML comments (`<!-- AUTO-DOC:START module=X -->` / `<!-- AUTO-DOC:END module=X -->`) delimiting auto-generated content for one module in `README.md`.
+- **Debounce**: Coalescing multiple rapid events into a single triggered action after a quiet period.
+- **Idempotent sync**: Running the sync pass again with no source changes produces no diff in `README.md`.
 
 ### 17.2 References
-
-- **Requirements Document**: `artifacts/requirements.md` (EPMCDMETST-62888)
-- **Python AST Documentation**: https://docs.python.org/3/library/ast.html
-- **Watchdog Documentation**: https://python-watchdog.readthedocs.io/
-- **Jinja2 Documentation**: https://jinja.palletsprojects.com/
-- **GitPython Documentation**: https://gitpython.readthedocs.io/
-- **PEP 8 Style Guide**: https://peps.python.org/pep-0008/
-- **PEP 257 Docstring Conventions**: https://peps.python.org/pep-0257/
+- Requirements Document: `artifacts/requirements.md`
 
 ### 17.3 Revision History
-
-- **2026-09-01**: Initial architecture design by Architecture Agent
-  - Designed for local Windows Python CLI application
-  - Monolithic event-driven architecture
-  - Template-based documentation generation
-  - Comprehensive component design
-  - Security, performance, and reliability considerations
-  - Ready for implementation phase
+- 2026-09-03: Initial architecture design by Architecture Agent.

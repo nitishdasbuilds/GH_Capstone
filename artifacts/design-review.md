@@ -3,244 +3,110 @@
 ## Review Summary
 - **Requirements Document**: `artifacts/requirements.md`
 - **Architecture Document**: `artifacts/architecture.md`
-- **Review Date**: 2026-09-01
+- **Review Date**: 2026-09-03
 - **Reviewed By**: Design Review Agent
 
 ### Overall Assessment
 **APPROVED WITH CONDITIONS**
 
-**Verdict Rationale**: The architecture is fundamentally sound and appropriate for a solo-developer demonstration project. The monolithic event-driven design matches the requirements well, and component boundaries are clearly defined. However, there are 3 critical ambiguities that must be resolved before implementation, 7 high-priority issues affecting reliability and security, and several medium/low issues that should be addressed to prevent technical debt.
+**Verdict Rationale**: The architecture is appropriately scoped, correctly rejects over-engineered options (no DB, no microservices, no async/multiprocessing), and covers most FR/NFR items with explicit component ownership. However, it has one critical functional gap around stale-doc removal on cold start, an internal diagram/text inconsistency affecting where path validation actually runs, and an unaddressed concurrency risk in the debounce mechanism. These must be resolved before implementation.
 
 ### Finding Statistics
 | Severity | Count |
 |----------|-------|
-| Critical | 3 |
-| High     | 7 |
-| Medium   | 8 |
-| Low      | 5 |
-| **Total** | **23** |
+| Critical | 1 |
+| High     | 2 |
+| Medium   | 4 |
+| Low      | 3 |
+| **Total** | **10** |
 
 ---
 
 ## Critical Findings
 > These must be resolved before implementation begins.
 
-### C-1: Template Storage Location Ambiguity
+### C-1: No reconciliation of orphaned README blocks against currently-existing `src/` files at startup
 - **Category**: Gap
-- **Affected Requirement**: FR-2 (Template-Based Documentation Generation)
-- **Finding**: The architecture presents conflicting information about template location. Section 4.1 Configuration entity specifies `templates_directory` as a configurable path (default: "templates/"). However, section 12.1 Project Structure shows templates in two locations: `doc_sync/generators/templates/` (packaged with code) and `templates/` (user-editable). The DocGenerator component description doesn't clarify which takes precedence or how template resolution works.
-- **Evidence**: 
-  - Configuration entity: `"templates_directory": str, # Path to template files`
-  - Project structure: Both `doc_sync/generators/templates/` and `templates/` exist
-  - DocGenerator: "Load Jinja2 templates from templates/ directory" (which templates/?)
-- **Recommendation**: Specify a clear template resolution strategy: (1) Load default templates from `doc_sync/generators/templates/` as fallback, (2) Load user overrides from configurable `templates_directory` (default: `./templates/`), (3) User templates take precedence over defaults. Update DocGenerator component description and add template resolution logic to design.
+- **Affected Requirement**: FR-4
+- **Finding**: FR-4's acceptance criteria require "If a module `.py` file is deleted from `src/`, its entire marker block is removed from `README.md`" on "the next sync pass" — and the tool is explicitly expected to run locally, started/stopped repeatedly (not as a CI daemon), with `git checkout`/branch switches called out as a normal trigger scenario (NFR-5). If a module file is deleted or renamed while the watcher process is **not running** (e.g., `git checkout` to a branch missing that file, or manual deletion between sessions), the Sync Orchestrator's startup routine only "enumerate[s] all `.py` files under `src/` for an initial full sync" — it never reads the existing marker blocks in `README.md` and diffs them against the set of files actually present on disk. Deletions are only detected via live `watchdog` `on_deleted` events during an active session (per the Sync Orchestrator responsibilities: "Determine deletions ... and route them to the README Sync Writer"). There is no described mechanism for detecting a module whose file was already gone *before* the watcher started.
+- **Evidence**: Section 2.3, Sync Orchestrator responsibilities: "On startup, enumerate all `.py` files under `src/` for an initial full sync" (no mention of comparing against existing README marker blocks). Section 2.3, README Sync Writer responsibilities only describe removal "For each deleted module" without defining how a deletion is discovered outside a live watchdog event.
+- **Recommendation**: Add an explicit startup reconciliation step to the Sync Orchestrator: parse all existing `<!-- AUTO-DOC:START module=X -->` blocks in `README.md`, compute the set difference against the currently-enumerated `src/*.py` modules, and route any module present in README but absent on disk to the README Sync Writer for removal — as part of the initial full sync, before (or alongside) processing currently-existing files.
 - **Effort Estimate**: Small
-
-### C-2: Auto-Generated Section Marker Specification Missing
-- **Category**: Gap
-- **Affected Requirement**: FR-3, FR-4 (Documentation Sync)
-- **Finding**: Requirements state "Generated documentation sections in README will be clearly marked (e.g., with HTML comments)" but the architecture provides no specification for: (1) The exact marker format, (2) How markers are inserted, (3) How DocumentationWriter parses and identifies marked sections, (4) What happens if markers are malformed or removed manually. Without this specification, FR-3's acceptance criterion "System preserves other README sections that are not auto-generated" cannot be implemented.
-- **Evidence**:
-  - Requirements Assumptions: "Generated documentation sections in README will be clearly marked (e.g., with HTML comments)"
-  - Architecture Section 2.3 DocumentationWriter: "Identify auto-generated sections (HTML markers)" - no format specified
-  - Architecture Section 5.1 CLI: "System preserves manual documentation changes in non-auto-generated sections" - no implementation detail
-- **Recommendation**: Define marker format explicitly: `<!-- AUTO-GENERATED:START:section_name -->` and `<!-- AUTO-GENERATED:END:section_name -->`. Specify that DocumentationWriter must: (1) Insert markers when creating new sections, (2) Search for markers using regex, (3) Replace content between matching markers only, (4) Log warning if markers are missing and prompt user for recovery action (manual mode vs. abort).
-- **Effort Estimate**: Medium
-
-### C-3: Batch Processing Scalability Limit Undefined
-- **Category**: Performance
-- **Affected Requirement**: NFR-1 (Performance)
-- **Finding**: Architecture specifies 2-second batching window but provides no upper bound on batch size. If 100 files change during a large refactoring, the system will attempt to process all 100 files in one SyncOperation. This could exceed the 5-minute sync target, exhaust memory, or cause the operation to fail. No strategy is defined for batch splitting or prioritization.
-- **Evidence**:
-  - Section 2.3 SyncOrchestrator: "Queue and deduplicate changes (batch window: 2 seconds)"
-  - Section 4.2 Data Flow: "Batching: Wait 2 seconds for related changes"
-  - NFR-1: "Complete sync cycle (detection → generation → commit): < 5 minutes"
-  - No maximum batch size mentioned anywhere
-- **Recommendation**: Add batch size limit to configuration (default: 20 files per batch). If more than 20 files change within the batch window, split into multiple sequential SyncOperations and log a warning. Update SyncOrchestrator component description to include batch splitting logic. Consider adding a priority queue where critical files (changed most recently) are processed first.
-- **Effort Estimate**: Medium
 
 ---
 
 ## High Findings
 
-### H-1: Review Prompt Mechanism Conflicts with Async Processing
-- **Category**: Design Risk
-- **Affected Requirement**: FR-5 (Conditional Review Workflow)
-- **Finding**: ReviewManager is described as prompting the user via "Console prompts" for approval, but the architecture uses asyncio for non-blocking operations. A synchronous console prompt during an async workflow will either block the entire event loop (defeating the purpose of async) or require complex async input handling. The architecture doesn't specify how this interaction works.
-- **Evidence**:
-  - Section 2.3 ReviewManager: "User interaction: Console prompts"
-  - Section 3.2 Backend: "Async Framework: asyncio (built-in)"
-  - Section 4.2 Data Flow step 8: "If major/critical: Prompt user for review"
-- **Recommendation**: Implement review prompts using async-compatible input: (1) Use `asyncio.to_thread()` to run blocking input() in a thread pool, or (2) Implement a review queue where operations requiring review are paused and listed by `status` command, with a separate `review approve <operation_id>` command to approve. Option 2 is cleaner for demonstration purposes and allows reviewing multiple operations in batch.
-- **Effort Estimate**: Medium
-
-### H-2: Configuration Validation Unspecified
-- **Category**: Reliability
-- **Affected Requirement**: NFR-3 (Reliability)
-- **Finding**: ConfigManager is responsible for validating configuration but no validation rules are specified. Invalid paths, negative thresholds, or malformed remote URLs could cause runtime failures. Architecture mentions "Validate configuration" but provides no detail on what is validated or how errors are reported.
-- **Evidence**:
-  - Section 2.3 ConfigManager: "Validate configuration"
-  - Section 4.1 Configuration entity lists 17 fields but no validation constraints
-  - Section 6.3 Application Security mentions "Config values: Type checking and bounds" but not specified
-- **Recommendation**: Specify validation rules in architecture: (1) Paths: must exist or be creatable, no path traversal (../, absolute paths validated), (2) Thresholds: positive integers with reasonable bounds (e.g., review_threshold_lines: 1-1000), (3) URLs: valid URL format, (4) Booleans: strict true/false, (5) Files: log_file and metrics_file must be writable. Validation failures should exit with clear error message during startup. Document validation in ConfigManager component description.
-- **Effort Estimate**: Small
-
-### H-3: Secret Detection Patterns Insufficient
+### H-1: Path Validator's position in the pipeline is inconsistent between the diagram and the component description
 - **Category**: Security
-- **Affected Requirement**: NFR-2 (Security)
-- **Finding**: Architecture lists 4 basic regex patterns for secret detection (API keys, AWS keys, private keys, passwords in config) but these are incomplete and vulnerable to false negatives. Missing: GitHub tokens (ghp_, gho_), GitLab tokens (glpat-), JWT tokens, database connection strings, SSH private key variations, base64-encoded secrets, and high-entropy strings.
-- **Evidence**:
-  - Section 6.2 Data Security: "Patterns Detected" lists only 4 patterns
-  - Section 2.3 SecretDetector: "Regular expression matching" with no comprehensive pattern list
-  - NFR-2 requires "scans generated documentation for common secret patterns"
-- **Recommendation**: Expand secret detection patterns to include: `ghp_[A-Za-z0-9]{36}` (GitHub PAT), `glpat-[A-Za-z0-9_\-]{20,}` (GitLab), `eyJ[A-Za-z0-9_\-]+\.eyJ[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-]+` (JWT), connection strings with `://.*:.*@`, entropy analysis for 32+ char alphanumeric strings (Shannon entropy > 4.5). Implement as pluggable pattern list in configuration. Add unit tests for each pattern with true/false positives.
-- **Effort Estimate**: Medium
-
-### H-4: Git Repository State Validation Missing
-- **Category**: Reliability
-- **Affected Requirement**: FR-6 (Version Control Integration)
-- **Finding**: GitManager assumes the repository is in a clean, committable state but doesn't validate this. If the repo is in detached HEAD, has a merge in progress, has uncommitted changes in tracked files, or has a broken Git configuration, the auto-commit will fail. The architecture describes error handling but not pre-validation.
-- **Evidence**:
-  - Section 2.3 GitManager: No mention of repository state validation
-  - Section 5.2 Error Handling: "Git errors: E400-E499" but no prevention strategy
-  - FR-6 acceptance criteria: "System handles merge conflicts" but not other Git states
-- **Recommendation**: Add Git repository state validation to GitManager initialization: (1) Check `git rev-parse --abbrev-ref HEAD` returns a branch name (not HEAD), (2) Check `git status --porcelain` for conflicts or merge state, (3) Warn if working tree has uncommitted changes (but don't block - documentation changes are expected), (4) Validate remote exists if git_remote is configured. If validation fails, log error with recovery instructions and disable Git integration for this session. Add `git_require_clean_state` boolean to configuration (default: false).
+- **Affected Requirement**: NFR-2
+- **Finding**: The high-level component diagram (Section 2.2) places the Path Validator conceptually between the raw watchdog event and the Event Debouncer, wired only into the live-event path. But the Path Validator's own interface description says: `is_within_workspace(path, root) -> bool`, "called by the Sync Orchestrator before any file is opened" (Section 2.3) — i.e., invoked much later, downstream of debouncing, and (implicitly) for *every* file the Sync Orchestrator processes, including the startup full-sync enumeration that never passes through the debouncer or the watchdog event path at all. These two descriptions cannot both be literally true as drawn; as written, a reader cannot tell whether startup-enumerated files (from `os.walk`/`Path.rglob`) are ever run through `is_within_workspace` at all, since the diagram only shows it wired to watchdog events.
+- **Evidence**: Section 2.2 diagram places "Path Validator" implicitly upstream of "Event Debouncer" for watchdog-sourced events (per the data flow arrows in Section 4.2: "watchdog event ──▶ Path Validator ──▶ Event Debouncer ──▶ Sync Orchestrator"), while Section 2.3's Path Validator interface states it is "called by the Sync Orchestrator" — a different, later stage that also covers the startup path.
+- **Recommendation**: Resolve the contradiction explicitly: state that Path Validator is a shared utility invoked by the Sync Orchestrator immediately before any file open, for **both** watchdog-triggered paths and startup-enumerated paths, and correct the Section 4.2 diagram/flow text to show validation happening at that single point rather than implying it sits in the raw event pipeline.
+- **Recommendation Detail**: Update Section 4.2's flow line to `watchdog event ──▶ Event Debouncer ──▶ Sync Orchestrator ──▶ (Path Validator, per file) ──▶ AST Extractor`, and add one sentence to Section 2.3 confirming startup-enumerated paths are validated identically.
 - **Effort Estimate**: Small
 
-### H-5: Template Injection Risk via Docstrings
-- **Category**: Security
-- **Affected Requirement**: NFR-2 (Security)
-- **Finding**: CodeAnalyzer extracts docstrings from user code and passes them to DocGenerator templates. If a malicious docstring contains Jinja2 template syntax (e.g., `{{ config.items() }}`), and auto-escaping is not properly configured, this could lead to template injection attacks exposing configuration or executing arbitrary template code. Architecture mentions "auto-escaping enabled" but doesn't specify the context (HTML auto-escape doesn't protect Markdown from code injection).
-- **Evidence**:
-  - Section 2.3 CodeAnalyzer: "Parse docstrings" - no sanitization mentioned
-  - Section 6.3 Security: "Templates: Jinja2 auto-escaping enabled" - assumes HTML context
-  - Markdown context doesn't benefit from HTML auto-escaping
-- **Recommendation**: Configure Jinja2 environment with strict undefined behavior and explicitly escape all user-provided content: (1) Use `jinja2.select_autoescape(['md', 'markdown'])` with custom escaping for Markdown special chars, (2) Pass docstrings through `escape()` filter in templates: `{{ docstring|escape }}`, (3) Alternatively, sanitize docstrings in CodeAnalyzer to strip Jinja2 syntax: remove `{{ }}`, `{% %}`, `{# #}` patterns before passing to templates. Document in DocGenerator security considerations.
-- **Effort Estimate**: Small
-
-### H-6: Metrics Retention Strategy Incomplete
+### H-2: Debounce buffer has no described concurrency/thread-safety mechanism
 - **Category**: Reliability
-- **Affected Requirement**: NFR-1 (Performance metrics)
-- **Finding**: Architecture specifies "last 100 operations" retention in metrics.json but doesn't address: (1) What happens if 200 operations occur in one hour vs. 100 operations over one week (time-based retention needed), (2) No cleanup of very old metrics file if service runs continuously for months, (3) No handling of corrupted metrics.json file.
-- **Evidence**:
-  - Section 4.1 Metrics entity: "Last 100 operations" - no time-based retention
-  - Section 9.1 Metrics: "Retained: Last 100 operations" - count-based only
-  - No discussion of metrics file corruption recovery
-- **Recommendation**: Implement hybrid retention strategy: Keep last 100 operations OR last 30 days, whichever is larger. Add `metrics_max_age_days` to configuration (default: 30). On startup, if metrics.json is corrupted, log warning, backup corrupted file, and start fresh. Add metrics file size check - if > 1MB, rotate to metrics.json.old and start new file. Document in MetricsTracker component.
+- **Affected Requirement**: NFR-5, FR-1
+- **Finding**: `watchdog`'s `Observer` dispatches filesystem events from a background thread, separate from the main thread. The Event Debouncer is described as using "Plain Python using `threading.Timer` (or a simple loop with timestamps)" to buffer and deduplicate paths in a shared collection (e.g., a `set[Path]`) that is written to by the watchdog event-handler thread and read/cleared by the timer callback (itself running on yet another thread). The architecture does not mention any lock, queue, or other synchronization primitive protecting this shared state. Without one, concurrent mutation of the buffer from two threads is a classic source of intermittent, hard-to-reproduce crashes or lost/duplicated events — directly undermining NFR-5's "must never crash" and "must keep running across repeated file-save events" requirements, which are exactly the burst-event scenarios (autosave, `git checkout`) most likely to trigger a race.
+- **Evidence**: Section 2.3, Event Debouncer: "Buffer incoming `ChangeEvent`s within a short window... Technology: Plain Python using `threading.Timer`... no external dependency needed" — no mention of locking or a thread-safe queue.
+- **Recommendation**: Specify that the Event Debouncer uses a `queue.Queue` (thread-safe by design) or an explicit `threading.Lock` guarding the shared buffer, and that the timer callback swaps/clears the buffer atomically under that lock before handing the batch to the Sync Orchestrator.
 - **Effort Estimate**: Small
-
-### H-7: File Permission and Lock Handling Unspecified
-- **Category**: Reliability
-- **Affected Requirement**: FR-3, FR-4 (Documentation Sync)
-- **Finding**: DocumentationWriter performs "atomic file writes (write to temp, rename)" but doesn't specify handling of: (1) File permission errors (README.md is read-only), (2) File locks (README.md open in editor), (3) Windows-specific file locking semantics where rename can fail if file is open. These are common failure modes on Windows.
-- **Evidence**:
-  - Section 2.3 DocumentationWriter: "Atomic file writes (write to temp, rename)"
-  - Section 6.3 Security: "Permission checks before writing" - not detailed
-  - Requirements Constraints: "Must run on Windows operating system"
-- **Recommendation**: Add robust file handling to DocumentationWriter: (1) Check file is writable before starting sync (os.access with W_OK), (2) Catch PermissionError and recommend closing editors or changing file attributes, (3) Implement retry logic with delay for locked files (3 attempts, 1-second delay), (4) If rename fails on Windows, use shutil.move with copy fallback, (5) Ensure temp files are in same filesystem as target (same drive on Windows) for atomic rename. Add file locking test to integration test suite.
-- **Effort Estimate**: Medium
 
 ---
 
 ## Medium Findings
 
-### M-1: Windows Service Mode Insufficiently Specified
+### M-1: No dependency version pinning specified
+- **Category**: Compliance / Maintainability
+- **Affected Requirement**: General (NFR-2 supply-chain adjacent)
+- **Finding**: The architecture states `watchdog` is "declared in `requirements.txt`" as the only new dependency but never specifies a version or version range anywhere in the document, and Python itself is only ever referred to as "Python 3.x." This is the exact gap the architecture's own review dimension (version numbers, not "latest") would flag, and leaves the implementation/verification agents with no pinned baseline to reproduce builds or track CVEs against.
+- **Evidence**: Section 3.5: "`watchdog` (PyPI package): Purpose — event-driven, cross-platform filesystem watching..." (no version). Section 3.2: "Language: Python 3.x."
+- **Recommendation**: Specify a minimum supported Python version (e.g., "Python 3.10+") and pin `watchdog` to a specific version or compatible range (e.g., `watchdog>=4.0,<5.0`) in `requirements.txt`.
+- **Effort Estimate**: Small
+
+### M-2: "Tolerant" encoding error handling conflicts with FR-5's explicit warn-and-skip requirement
 - **Category**: Gap
-- **Affected Requirement**: NFR-4 (Usability)
-- **Finding**: CLI start command includes `--daemon` flag for "Windows service mode" but the architecture provides no design for this. Running as a Windows service requires: service registration, startup configuration, logging without console, graceful shutdown on service stop, and service status reporting. This is significantly more complex than a foreground process.
-- **Evidence**: Section 5.1 CLI: `--daemon  Run in background (Windows service mode)`
-- **Recommendation**: Either (1) Remove --daemon flag and keep it simple (foreground process only), or (2) Specify Windows service implementation using `pywin32` or `nssm` (Non-Sucking Service Manager) wrapper. Given demonstration focus, option 1 is recommended. If daemon mode is essential, defer to "future considerations" and implement with clear documentation on service installation steps.
-- **Effort Estimate**: Large (if implementing) / Small (if removing)
-
-### M-2: Code Analysis Cache Lacks Dependency Awareness
-- **Category**: Performance
-- **Affected Requirement**: NFR-1 (Performance)
-- **Finding**: Architecture specifies caching ParsedCodeStructure by file hash, but Python code documentation often depends on imports and related files. If module A imports module B and B changes, A's cached analysis might generate incorrect documentation (e.g., imported class signatures changed). Hash-based caching doesn't detect this.
-- **Evidence**: Section 4.3 Caching Strategy: "Cache Keys: SHA256(file_content)" - no dependency tracking
-- **Recommendation**: Accept this limitation and document it as a known issue, or implement basic dependency invalidation: when a file changes, invalidate cache for all files that import it (track import relationships during analysis). For v1 demonstration, document as limitation and recommend manual sync if imports change: "Cache is file-scoped only; changes to imported modules require manual sync of importing files."
-- **Effort Estimate**: Large (if implementing dependency tracking) / Small (if documenting limitation)
-
-### M-3: Backup File Cleanup Strategy Missing
-- **Category**: Maintainability
-- **Affected Requirement**: NFR-3 (Reliability)
-- **Finding**: DocumentationWriter creates backups before modifications but architecture provides no cleanup strategy. Over time, backup files will accumulate indefinitely, consuming disk space. No retention policy is defined.
-- **Evidence**: Section 2.3 DocumentationWriter: "Create backups before changes" - no cleanup mentioned
-- **Recommendation**: Implement backup retention: keep last 10 backups per documentation file, delete older backups. Add backup cleanup to DocumentationWriter after successful write. Store backups in `.doc_sync_backups/` directory (gitignored) with timestamp in filename: `README.md.backup.20260901_143215`. Add `backup_retention_count` to configuration (default: 10).
+- **Affected Requirement**: FR-5, FR-2
+- **Finding**: FR-2's acceptance criteria and FR-5 both require that unreadable/undecodable files be skipped **with a logged warning** containing the file path and reason. The AST Extractor's responsibility is described as reading "file content (with explicit UTF-8 decoding, tolerant error handling for encoding issues)" — "tolerant" is ambiguous and could reasonably be implemented as silently replacing/ignoring bad bytes (e.g., `errors="replace"`) rather than treating a decode failure as an error to be raised and logged. If implemented as silent tolerance, encoding problems would never surface as the FR-5-mandated warning, and could instead corrupt rendered docstring content in `README.md` silently.
+- **Evidence**: Section 2.3, AST Extractor: "Read file content (with explicit UTF-8 decoding, tolerant error handling for encoding issues)."
+- **Recommendation**: Replace "tolerant error handling" with an explicit contract: decode using strict UTF-8 (`errors="strict"`); on `UnicodeDecodeError`, raise the same typed `ExtractionError` used for `SyntaxError` so it is caught and logged as a `WARNING` by the Sync Orchestrator per FR-5, rather than silently substituting characters.
 - **Effort Estimate**: Small
 
-### M-4: Line Ending Handling Not Addressed
-- **Category**: Maintainability
-- **Affected Requirement**: FR-3, FR-4 (Documentation generation)
-- **Finding**: Generated Markdown line endings (LF vs CRLF) are not specified. On Windows, Git typically uses LF internally but working tree may use CRLF (configurable via git core.autocrlf). If generated docs use inconsistent line endings, this creates noisy Git diffs and may cause validation failures.
-- **Evidence**: No mention of line ending handling in architecture
-- **Recommendation**: Normalize line endings in DocumentationWriter: (1) Detect target file's current line ending style (LF or CRLF), (2) Apply same style to generated content, (3) Alternatively, respect Git's core.autocrlf setting. For consistency, recommend LF everywhere (Unix-style) and document in setup instructions: "Configure git core.autocrlf=input for consistent line endings."
-- **Effort Estimate**: Small
-
-### M-5: Git Commit Message Format Incomplete
+### M-3: Signature rendering doesn't explicitly address keyword-only and positional-only parameters
 - **Category**: Gap
-- **Affected Requirement**: FR-6 (Version Control Integration)
-- **Finding**: GitManager commit message format is described as "docs: auto-update from example.py changes" but edge cases are not specified: (1) What if multiple files changed? (2) What if JIRA key extraction fails? (3) What if commit message becomes very long (>72 char subject line convention)?
-- **Evidence**: Section 4.2 Data Flow step 11: Example commit message shown, but no format specification
-- **Recommendation**: Define commit message template: `docs(auto): update from {file_count} file changes\n\nFiles:\n- {file1}\n- {file2}\n\nJIRA: {issue_key}\nOperation ID: {sync_op_id}`. Truncate file list if > 10 files. If JIRA key not found, omit JIRA line. Keep subject line ≤ 72 chars. Add commit message formatter unit tests.
+- **Affected Requirement**: FR-2
+- **Finding**: FR-2 requires full signatures including "parameter names, defaults, `*args`/`**kwargs`, return annotation." The AST Extractor's described responsibility only enumerates "positional, defaults, `*args`, `**kwargs`, return annotation" — it does not mention `ast.arguments.posonlyargs` (PEP 570, the `/` marker) or `kwonlyargs`/`kw_defaults` (the `*` marker for keyword-only parameters). Any module-level function using either modern syntax feature (common in current Python code) would have an incompletely/incorrectly rendered signature.
+- **Evidence**: Section 2.3, AST Extractor responsibilities: "Render each function's signature as a string from `ast.arguments` (positional, defaults, `*args`, `**kwargs`, return annotation)."
+- **Recommendation**: Explicitly list all five `ast.arguments` component groups to be rendered: `posonlyargs` (with trailing `/`), `args` (with defaults), `vararg`, `kwonlyargs`/`kw_defaults` (with leading bare `*` when present and no `vararg`), and `kwarg`, plus the return annotation.
 - **Effort Estimate**: Small
 
-### M-6: Large File Handling Strategy Absent
-- **Category**: Performance
-- **Affected Requirement**: NFR-1 (Performance)
-- **Finding**: Architecture mentions "Parses files up to 10,000 lines efficiently" but doesn't specify what happens for files exceeding this. Should the system skip them, warn, or attempt processing with degraded performance?
-- **Evidence**: Section 7.1 Scalability: "File Size: Parses files up to 10,000 lines efficiently" - no handling beyond limit
-- **Recommendation**: Add file size validation to CodeAnalyzer: (1) Check file line count before parsing, (2) If > 10,000 lines, log warning and skip file (or make threshold configurable), (3) Add `max_file_lines` to configuration (default: 10,000), (4) Report skipped files in sync operation summary. For very large files, recommend splitting or using manual documentation.
-- **Effort Estimate**: Small
-
-### M-7: Symbolic Link and Junction Point Handling
+### M-4: No mitigation for the developer's editor holding unsaved `README.md` changes when a sync pass writes the file
 - **Category**: Reliability
-- **Affected Requirement**: FR-1 (File Watching)
-- **Finding**: FileWatcherService monitors src/ directory but doesn't specify behavior for symbolic links or Windows junction points. Following symlinks could lead to infinite loops, watching outside intended scope, or permission errors.
-- **Evidence**: No mention of symlink handling in FileWatcherService or watchdog configuration
-- **Recommendation**: Configure watchdog observer with `recursive=True` but add symlink handling: (1) Document that symbolic links are not followed (watchdog default behavior), (2) Log warning if symlinks detected in src/, (3) Add `follow_symlinks` configuration option (default: false) for advanced users. Test with junction point to verify Windows behavior.
+- **Affected Requirement**: NFR-5 (adjacent), General
+- **Finding**: The atomic-write decision (Decision 5) protects against the tool's own process crashing mid-write, but does not address the realistic scenario where a developer has `README.md` open in an editor with unsaved manual edits outside the marker blocks at the moment a sync pass runs `os.replace()`. Depending on the editor, this can either be transparently picked up (fine) or cause the editor to silently continue displaying stale content that, if saved afterward, overwrites the tool's just-written auto-doc block — undermining the "hand-written content is preserved" goal (FR-3) in practice, even though the architecture is not technically at fault.
+- **Recommendation**: Add a brief note to the Operability/Usability guidance (Section 9 or 12) recommending the tool log an `INFO` line whenever it writes `README.md`, and recommending developers avoid leaving `README.md` open with unsaved edits while the watcher runs — this is a documentation-level mitigation, not a code change.
 - **Effort Estimate**: Small
-
-### M-8: Template Modification Hot Reload Race Condition
-- **Category**: Reliability
-- **Affected Requirement**: FR-2 (Template-Based Documentation Generation)
-- **Finding**: Architecture specifies "Template Caching: reload if file modified (watch template directory)" but doesn't address race conditions if a template is being modified while a sync operation is using it. This could cause TemplateNotFoundError or partial template reads.
-- **Evidence**: Section 4.3 Caching: "TTL Strategy: Reload if file modified" - no concurrency handling
-- **Recommendation**: Implement safe template reloading: (1) Use file locks or atomic reload (load new template to temp, swap reference), (2) If template load fails during reload, keep using old cached version and log warning, (3) Alternatively, disable auto-reload and require service restart for template changes (simpler for demonstration). Document chosen approach in DocGenerator.
-- **Effort Estimate**: Small (if disabling auto-reload) / Medium (if implementing safe reload)
 
 ---
 
 ## Low Findings
 
-### L-1: Test Configuration Files Not Specified
+### L-1: No fast-forward/injection point described for testing the debounce window
 - **Category**: Maintainability
-- **Finding**: Architecture mentions black and pylint for code quality but doesn't specify configuration files (pyproject.toml for black, .pylintrc for pylint). Different default configurations could lead to inconsistent formatting or linting between development sessions.
-- **Recommendation**: Include pyproject.toml and .pylintrc in project structure with documented settings. Specify in section 12.1: add `pyproject.toml` (black config, pytest config), `.pylintrc` (pylint rules), and `setup.cfg` if needed. Commit these files to repository.
-- **Effort Estimate**: Small
+- **Finding**: Section 12.2 mentions unit tests for the Extractor, Renderer, and README Sync Writer, and an integration test that invokes the Sync Orchestrator directly "without requiring real filesystem events" — but does not mention how the Event Debouncer itself (the component with the actual timing behavior) will be tested without real sleeps, risking flaky or slow tests.
+- **Recommendation**: Note that the debounce window duration should be injectable (e.g., a constructor parameter) so tests can use a near-zero window or a fake clock instead of the real 300–500ms delay.
 
-### L-2: Log Retention Based on Size Only, Not Time
+### L-2: No explicit mention of watch handle/observer cleanup on shutdown
+- **Category**: Reliability
+- **Finding**: NFR-5 requires no leaked file handles/watches, but Section 5.1 only states the CLI "stops the observer and exits with code 0" on `SIGINT` without describing that `Observer.stop()` must be paired with `Observer.join()` to fully release OS-level watch handles before process exit.
+- **Recommendation**: Add one sentence to Section 5.1 or 8.3 specifying `observer.stop()` followed by `observer.join()` in the `SIGINT` handler.
+
+### L-3: Python minimum version left as "3.x" throughout
 - **Category**: Maintainability
-- **Finding**: Logger uses "10 MB per file, keep 5 backups" but no time-based retention. In low-activity scenarios, logs could span months, making incident investigation harder. In high-activity scenarios, important recent logs might rotate out quickly.
-- **Recommendation**: Add time-based log retention as secondary policy: rotate daily or weekly in addition to size-based rotation. Use Python logging.handlers.TimedRotatingFileHandler or a hybrid approach. Document retention policy in logger configuration.
-- **Effort Estimate**: Small
-
-### L-3: Performance Benchmark Baselines Absent
-- **Category**: Performance
-- **Finding**: NFR-1 specifies performance targets (< 5s detection, < 3min sync) but architecture doesn't establish baseline measurements or specify how these will be validated. Without benchmarks, it's unclear if targets are achievable with chosen tech stack.
-- **Recommendation**: Add performance validation strategy: (1) Create benchmark suite with representative Python files (100 lines, 1000 lines, 5000 lines), (2) Measure parse time, template generation time, and end-to-end sync time, (3) Document results in architecture as baseline, (4) Add performance regression tests to CI/CD.
-- **Effort Estimate**: Medium
-
-### L-4: Type Hints Coverage Not Mandated
-- **Category**: Maintainability
-- **Finding**: Architecture mentions mypy as optional for type checking but doesn't specify type hint coverage requirements. Inconsistent type hints reduce mypy's effectiveness and make the codebase harder to maintain.
-- **Recommendation**: Either (1) Make type hints mandatory for all public functions/methods and enforce with mypy in CI, setting a coverage threshold (e.g., 80%), or (2) Explicitly document that type hints are optional and mypy is not part of the development workflow. For demonstration quality, option 1 is recommended.
-- **Effort Estimate**: Small
-
-### L-5: Metrics JSON Schema Versioning Absent
-- **Category**: Maintainability
-- **Finding**: metrics.json file structure is defined but has no schema version field. If metrics format changes in future updates, there's no way to detect or migrate old metrics files.
-- **Recommendation**: Add `"schema_version": "1.0"` field to metrics.json. When loading metrics, check version and handle migration or reset if schema changed. Document schema version in MetricsTracker component.
-- **Effort Estimate**: Small
+- **Finding**: Every reference to the language version says "Python 3.x" rather than a concrete minimum (relevant since `ast.arguments.posonlyargs` requires 3.8+ and modern union-type annotation rendering behavior varies by version).
+- **Recommendation**: State a concrete minimum Python version in Section 3.2 (this is the same underlying gap as M-1, called out separately here for the version-numbers-not-"latest" consistency dimension).
 
 ---
 
@@ -248,21 +114,16 @@
 
 | Requirement | ID | Architectural Owner | Status | Notes |
 |-------------|-----|---------------------|--------|-------|
-| File Watching and Change Detection | FR-1 | FileWatcherService | Covered | Watchdog-based, debouncing specified |
-| Template-Based Documentation Generation | FR-2 | DocGenerator | Partial | Template location ambiguity (C-1) |
-| README Documentation Sync | FR-3 | DocumentationWriter | Partial | Section marker format missing (C-2) |
-| API Documentation Sync | FR-4 | DocGenerator + DocumentationWriter | Partial | Section marker format missing (C-2) |
-| Conditional Review Workflow | FR-5 | ReviewManager | Partial | Async interaction conflict (H-1) |
-| Version Control Integration | FR-6 | GitManager | Partial | Repo state validation missing (H-4) |
-| JIRA Integration | FR-7 | JIRAClient | Covered | Specified, low priority, optional |
-| Conflict Resolution | FR-8 | GitManager | Covered | Code-precedence strategy specified |
-| Performance | NFR-1 | All components | Partial | Batch size limit missing (C-3), metrics retention (H-6) |
-| Security | NFR-2 | SecretDetector, ConfigManager | Partial | Secret patterns incomplete (H-3), template injection (H-5) |
-| Reliability | NFR-3 | Logger, Error Handling | Partial | Config validation missing (H-2), file locking (H-7) |
-| Usability | NFR-4 | CLI, ConfigManager | Covered | Windows service mode underspecified (M-1) |
-| Maintainability | NFR-5 | Code Organization | Covered | Test configs missing (L-1), type hints optional (L-4) |
-
-**Summary**: 13 requirements total. 4 fully covered, 9 partially covered (with identified gaps), 0 missing.
+| File watcher for source changes | FR-1 | File Watcher, Sync Orchestrator | Covered | Entry point, recursive watch, `.py` filtering all described |
+| AST-based code structure extraction | FR-2 | AST Extractor | Partial | See M-3 (kwonly/posonly args) and M-2 (encoding handling) |
+| Auto-generated Markdown section sync | FR-3 | Markdown Renderer, README Sync Writer | Covered | Marker format, idempotency, atomic write all described |
+| Removal of stale documentation | FR-4 | Sync Orchestrator, README Sync Writer | Partial | C-1: no startup reconciliation for pre-existing deletions |
+| Warning logging on failure | FR-5 | Logger, Sync Orchestrator | Partial | M-2: "tolerant" encoding handling may bypass the warning path |
+| Performance (single file <2s, no polling) | NFR-1 | File Watcher, AST Extractor | Covered | Event-driven design, per-file budget addressed |
+| Security (read-only src, README-only write, path validation) | NFR-2 | AST Extractor, Path Validator | Partial | H-1: Path Validator wiring inconsistent between diagram and text |
+| Scalability (100 files / 10s) | NFR-3 | Sync Orchestrator | Covered | Sequential processing justified against target |
+| Usability (zero-config, clear logs) | NFR-4 | Logger, CLI entry point | Covered | Log format and CLI invocation both specified |
+| Reliability (no crash, no handle leaks) | NFR-5 | Event Debouncer, Sync Orchestrator | Partial | H-2 (debounce race), L-2 (observer cleanup) |
 
 ---
 
@@ -270,151 +131,51 @@
 
 | Control | Status | Finding Ref |
 |---------|--------|-------------|
-| All API endpoints authenticated | N/A | No API endpoints (CLI only) |
-| Input validated at system boundary | Partial | H-2 (config validation) |
-| Secrets managed via vault/env injection | Pass | Environment variables specified |
-| PII encrypted at rest | N/A | No PII in scope |
-| PII encrypted in transit | Pass | TLS for Git/JIRA |
-| No sensitive data in logs | Pass | Explicitly documented |
-| Third-party dependencies pinned | Pass | requirements.txt with pinned versions |
-| Admin endpoints segregated | N/A | No admin endpoints |
-| Template injection protection | Fail | H-5 (docstring injection risk) |
-| Secret detection comprehensive | Fail | H-3 (insufficient patterns) |
-| Path traversal protection | Partial | Mentioned but not specified |
-| Code injection prevention | Pass | AST parsing, no eval/exec |
+| All API endpoints authenticated | Pass (N/A — no network API) | |
+| Input validated at system boundary | Partial | H-1 |
+| Secrets managed via vault/env injection | Pass (N/A — no secrets used) | |
+| PII encrypted at rest | Pass (N/A — no PII in scope) | |
+| PII encrypted in transit | Pass (N/A — no network transport) | |
+| No sensitive data in logs | Pass | |
+| Third-party dependencies pinned | Fail | M-1 |
+| Admin endpoints segregated | Pass (N/A — no endpoints) | |
 
 ---
 
 ## Approved Items
 > These aspects of the architecture are well-designed and should not be changed without a new review.
 
-- **Monolithic Architecture Choice**: Appropriate for solo developer, local execution, and demonstration goals. Avoids unnecessary distributed complexity.
-- **Event-Driven File Watching with Debouncing**: Watchdog library with 300ms debounce and 2s batching is industry-standard and efficient for this use case.
-- **Component Separation**: Clear boundaries between FileWatcher, CodeAnalyzer, DocGenerator, DocumentationWriter, GitManager, and supporting services. Good separation of concerns.
-- **Python AST for Code Parsing**: Safe, built-in, accurate. Avoids regex fragility and security issues with eval/exec.
-- **Template-Based Generation with Jinja2**: Matches requirements, predictable, fast, suitable for demonstration. Correct choice over AI/LLM for this scope.
-- **Async I/O with asyncio**: Appropriate for I/O-bound operations (file, network). Allows non-blocking monitoring.
-- **Environment Variables for Credentials**: Standard security practice, avoids plaintext in config, documented clearly.
-- **Backup Before Modification**: DocumentationWriter creates backups before changes - good safety mechanism.
-- **Git Auto-Commit with Optional Push**: Sensible default (push disabled), provides safety while enabling automation.
-- **Performance Targets**: Specific, measurable metrics (< 5s detection, < 3min sync, ≥ 95% success rate) make validation possible.
-- **JSON for Metrics**: Lightweight, human-readable, appropriate for single-user demonstration. Avoids database overkill.
-- **Modular Project Structure**: Clean package organization with logical separation. Supports maintainability and testing goals.
+- The choice of a single-process, event-driven CLI architecture with no database, no microservices, and no async/multiprocessing is correctly matched to the stated scale (≤100 files, single developer machine) — no over-engineering.
+- `ast.parse`-only extraction (never `exec`/`import`) is explicitly justified against NFR-2 and correctly rejects the `importlib`/`inspect` alternative for the right reason (arbitrary code execution risk).
+- Marker-block strategy (HTML comment pairs, per-module) directly matches the requirement's specified format and correctly handles preservation of hand-written content by scoping replacement to only the block between markers.
+- Atomic write via temp-file + `os.replace()` correctly protects `README.md` against partial/corrupted writes on crash or interruption (Decision 5).
+- Debounce window design correctly targets the "rapid successive save events" risk called out in the requirements document, independent of the thread-safety gap noted in H-2.
 
 ---
 
 ## Conditions for Approval
-> These items must be addressed before implementation agent proceeds:
+> Track these before/during implementation:
 
-1. **Resolve C-1 (Template Storage)**: Specify clear template resolution strategy (default vs. user override) and document in architecture. Update Project Structure and DocGenerator component description accordingly.
-
-2. **Resolve C-2 (Section Markers)**: Define exact HTML comment marker format for auto-generated sections and add marker parsing/insertion logic to DocumentationWriter component description.
-
-3. **Resolve C-3 (Batch Limit)**: Add maximum batch size configuration (recommend 20 files) and batch splitting logic to SyncOrchestrator. Update component description and configuration entity.
-
-4. **Address H-1 (Review Interaction)**: Clarify how ReviewManager interacts with asyncio event loop. Recommend separate review queue with CLI command approach for demonstration clarity.
-
-5. **Address H-2 (Config Validation)**: Document validation rules for all configuration fields in ConfigManager component description, including error handling.
-
-6. **Address H-3 (Secret Patterns)**: Expand secret detection regex patterns to include GitHub tokens, JWT, connection strings, and entropy analysis. Add comprehensive pattern list to SecretDetector.
-
-7. **Address H-4 (Git State)**: Add repository state validation to GitManager initialization. Document failure modes and recovery instructions.
-
-8. **Address H-5 (Template Injection)**: Specify Jinja2 escaping strategy for user-provided docstrings in Markdown context. Update DocGenerator security considerations.
-
-9. **Address H-6 (Metrics Retention)**: Implement hybrid retention (count + time based). Document in MetricsTracker and add corruption recovery.
-
-10. **Address H-7 (File Locking)**: Add file permission checking and Windows-specific lock handling to DocumentationWriter with retry logic.
+1. Add startup reconciliation logic to the Sync Orchestrator to detect and remove orphaned README marker blocks for modules no longer present in `src/` (resolves C-1).
+2. Correct the Section 4.2 data-flow diagram/text and Section 2.3 Path Validator description so both consistently state it runs per-file from the Sync Orchestrator for both startup-enumerated and watchdog-triggered files (resolves H-1).
+3. Specify a thread-safe mechanism (lock or `queue.Queue`) for the Event Debouncer's shared buffer (resolves H-2).
+4. Pin `watchdog`'s version in `requirements.txt` and state a minimum Python version (resolves M-1/L-3).
+5. Replace "tolerant" encoding handling with strict UTF-8 decoding that raises `ExtractionError` on failure, caught and logged per FR-5 (resolves M-2).
+6. Explicitly enumerate `posonlyargs`/`kwonlyargs` handling in the signature-rendering responsibility of the AST Extractor (resolves M-3).
 
 ---
 
 ## Unresolved Open Questions
-> These questions from the architecture document must be answered during implementation:
+> No "Open Questions" section exists in `artifacts/architecture.md`. The following questions were identified during this review and should be answered before or during implementation:
 
-1. **Template Format Details** (from Architecture Section 15): What specific information should API documentation include? Recommend: function signature, parameters with types, return type, docstring description, usage example (if provided in docstring).
-
-2. **Review Interface** (from Architecture Section 15): Console-based or text editor? **Decision**: Console-based with y/n prompt and diff preview (simpler for demonstration).
-
-3. **Metrics Visualization** (from Architecture Section 15): Should there be graphical view? **Decision**: Not in v1, status command is sufficient.
-
-4. **Multiple Projects** (from Architecture Section 15): Should one instance handle multiple projects? **Decision**: No, one instance per project (keep simple).
-
-5. **Error Notification** (from Architecture Section 15): Desktop notifications? **Decision**: Not in v1, console + log sufficient.
-
-6. **Windows Service Implementation** (finding M-1): Should --daemon flag be implemented or removed? **Recommendation**: Remove for v1, defer to future if needed.
-
----
-
-## Additional Observations
-
-### Strengths
-- Architecture document is comprehensive and well-structured, demonstrating thorough design thinking.
-- Technology choices are well-justified with clear rationale tied to requirements.
-- ASCII diagrams are clear and helpful for understanding component relationships.
-- Risk analysis in architecture Section 14 shows awareness of potential issues.
-- Security considerations are present throughout, even if some details need refinement.
-- The 8 key design decisions are well-documented with alternatives and rationale.
-
-### Areas for Improvement
-- Several component descriptions use "will" or "should" language without specifying "how" (implementation ambiguity).
-- Some configuration fields are mentioned in text but not reflected in the Configuration entity table (e.g., git_auto_push).
-- Error handling is described generally but specific error codes (E001-E999) lack component mapping.
-- Test strategy is mentioned (pytest, 70% coverage) but test organization and fixture strategy is minimal.
-
-### Recommendation for Architecture Agent
-If architecture is revised to address findings, focus on:
-1. Eliminating ambiguities (C-1, C-2, C-3) with concrete specifications
-2. Strengthening security (H-3, H-5) with specific implementations
-3. Improving reliability (H-2, H-4, H-6, H-7) with validation and error handling
-4. Clarifying async interaction patterns (H-1) for review workflow
+1. When a module is deleted while the watcher is not running, should the startup reconciliation (per C-1) treat this identically to a live `on_deleted` event, or log a distinct message (e.g., "removed stale section for module no longer present at startup")?
+2. Should the Event Debouncer's window duration be a hardcoded constant or a CLI-configurable value (currently unspecified either way)?
 
 ---
 
 ## Appendix: Review Methodology
-
-### Requirements Coverage Check
-- Extracted all 8 FR-X and 5 NFR-X requirements from requirements.md
-- Cross-referenced each requirement against architecture components in Section 2.3
-- Verified data flow in Section 4.2 addresses end-to-end requirement fulfillment
-- Identified gaps where architectural components lacked specification details (C-1, C-2)
-
-### Security Review
-- Applied OWASP Top 10 considerations (injection, authentication, sensitive data exposure)
-- Reviewed secret management strategy against industry standards
-- Examined input validation at all system boundaries (CLI, config, code files, templates)
-- Checked for code injection vectors (template injection, eval/exec usage)
-- Validated dependency security approach (pinned versions, CVE tracking mentioned)
-- Identified specific vulnerabilities: template injection (H-5), weak secret patterns (H-3)
-
-### Performance Review
-- Compared stated NFR-1 targets (<5s detection, <3min sync, ≥95% success) against technology choices
-- Verified watchdog library performance characteristics support 5s detection target
-- Analyzed batch processing strategy for scalability limits (found C-3: no batch size cap)
-- Reviewed caching strategies for effectiveness (found M-2: no dependency awareness)
-- Checked for synchronous bottlenecks in async architecture (found H-1: console prompts)
-
-### Data Architecture Review
-- Verified all data models from requirements Section "Technical Requirements" are reflected
-- Checked data model completeness (found git_auto_push in text but not Configuration entity)
-- Analyzed data persistence strategy (JSON for metrics, YAML for config) for appropriateness
-- Reviewed data flow diagram for completeness (well-specified)
-
-### Integration Review
-- Identified external dependencies: Git hosting, JIRA, OS file system
-- Verified failure modes specified for JIRA (optional, graceful degradation)
-- Checked Git integration completeness (found H-4: repo state validation missing)
-- Examined credential management (appropriate: environment variables)
-
-### Operability Review
-- Reviewed logging strategy (appropriate: levels, rotation, structured format)
-- Checked metrics collection (appropriate: success rate, duration, operation history)
-- Verified error handling described (general strategy present, specific gaps identified)
-- Examined deployment process (manual installation, simple for single user)
-
-### Consistency Check
-- Found terminology inconsistency: "templates/" vs "doc_sync/generators/templates/" (C-1)
-- Found data model inconsistency: git_auto_push mentioned but not in Configuration table
-- Verified component names in diagram match text (consistent)
-- Checked version numbers specified (requirements.txt mentioned, no specific versions in architecture)
-
-This review was conducted with an adversarial mindset, actively searching for gaps, ambiguities, and risks rather than confirming correctness. All findings are evidence-based with specific references to source documents.
+- Requirements coverage: checked each FR-X and NFR-X against architecture components in Section 2.3 and the data flow in Section 4.2.
+- Security: reviewed against OWASP Top 10 (relevant categories: injection via untrusted file paths, insufficient input validation) and NFR-2's stated threat model.
+- Performance: compared NFR-1/NFR-3 targets against the sequential, single-process processing model in Section 7.
+- Data: validated `ModuleInfo`/`FunctionInfo` schema (Section 4.1) against FR-2's extraction requirements.
+- Consistency: cross-checked component names and data-flow direction between Section 2.2 (diagram), Section 2.3 (component descriptions), and Section 4.2 (detailed flow).
