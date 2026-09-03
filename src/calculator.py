@@ -34,7 +34,7 @@ def divide(a: float, b: float) -> float:
         raise ZeroDivisionError("division by zero")
     return a / b
 
-
+#Adding a comment
 class Calculator:
     """A tiny stateful calculator that accumulates a running total."""
 
