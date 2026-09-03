@@ -1,0 +1,31 @@
+{
+  "expand": "renderedFields,names,schema,operations,editmeta,changelog,versionedRepresentations",
+  "id": "14365153",
+  "self": "https://jiraeu.epam.com/rest/api/2/issue/14365153",
+  "key": "EPMCDMETST-62888",
+  "fields": {
+    "summary": "Automated Documentation Sync for Code Changes",
+    "description": "As a developer, I want an automated system that detects \r\nchanges in source code files and automatically updates \r\nthe corresponding documentation files, so that project \r\ndocumentation is always in sync with the latest code changes.",
+    "priority": {
+      "self": "https://jiraeu.epam.com/rest/api/2/priority/10201",
+      "iconUrl": "https://jiraeu.epam.com/images/icons/priorities/medium.svg",
+      "name": "Medium",
+      "id": "10201"
+    },
+    "status": {
+      "self": "https://jiraeu.epam.com/rest/api/2/status/1",
+      "description": "The issue is open and ready for the assignee to start work on it.",
+      "iconUrl": "https://jiraeu.epam.com/images/icons/statuses/open.png",
+      "name": "Open",
+      "id": "1",
+      "statusCategory": {
+        "self": "https://jiraeu.epam.com/rest/api/2/statuscategory/2",
+        "id": 2,
+        "key": "new",
+        "colorName": "default",
+        "name": "To Do"
+      }
+    }
+  },
+  "renderedFields": null
+}
