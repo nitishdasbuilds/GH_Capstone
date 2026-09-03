@@ -3,6 +3,7 @@
 Script to add a comment to a Jira ticket using REST API.
 """
 
+import argparse
 import os
 import sys
 import requests
@@ -77,11 +78,23 @@ def add_jira_comment(email, api_token, ticket_id, comment_text, jira_base_url):
 
 def main():
     """Main function to add a comment to a Jira ticket."""
+    parser = argparse.ArgumentParser(description="Add a comment to a Jira ticket using REST API")
+    parser.add_argument("ticket_id", nargs="?", default="EPMCDMETST-62888", help="Jira ticket ID (e.g., EPMCDMETST-62888)")
+    parser.add_argument("--comment", help="Comment text to post")
+    parser.add_argument("--comment-file", help="Path to a file whose contents will be used as the comment text")
+    args = parser.parse_args()
+
     # Configuration
     JIRA_BASE_URL = "https://jiraeu.epam.com"
-    TICKET_ID = "EPMCDMETST-62888"
-    
-    COMMENT_TEXT = """Agentic SDLC Pipeline Progress Update:
+    TICKET_ID = args.ticket_id
+
+    if args.comment_file:
+        with open(args.comment_file, "r", encoding="utf-8") as f:
+            COMMENT_TEXT = f.read()
+    elif args.comment:
+        COMMENT_TEXT = args.comment
+    else:
+        COMMENT_TEXT = """Agentic SDLC Pipeline Progress Update:
 ✅ Phase 1 - Requirements: Complete
 ✅ Phase 2 - Architecture: Complete  
 ✅ Phase 3 - Design Review: Complete (Approved with Conditions)

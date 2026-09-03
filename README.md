@@ -57,6 +57,16 @@ GH_Capstone/
 - `subtract(a, b)` — Return the difference between two numbers.
 - `multiply(a, b)` — Return the product of two numbers.
 - `divide(a, b)` — Return the quotient of two numbers.
+
+**`doc_sync`**
+
+- `analyze_module(file_path)` — Parse a Python file and extract its public functions and docstrings.
+- `render_api_usage_section(modules)` — Render the API usage examples section from parsed modules (FR-2, FR-4).
+- `render_configuration_section()` — Render the configuration options section (FR-3).
+- `apply_section(content, section_name, body)` — Replace the contents between AUTO-GENERATED markers for one section.
+- `sync_readme(modules)` — Regenerate the auto-generated sections of README.md (FR-3).
+- `sync_once()` — Analyze every .py file under src/ once and sync README.md, then return.
+- `main()` — Start the file watcher (default) or run a single sync pass with --once.
 <!-- AUTO-GENERATED:END:api_usage -->
 
 

@@ -22,6 +22,7 @@ Design decisions from artifacts/impl-plan.md:
 
 from __future__ import annotations
 
+import argparse
 import ast
 import logging
 import re
@@ -275,8 +276,35 @@ class PythonFileChangeHandler(FileSystemEventHandler):
         self._handle_event(event)
 
 
+def sync_once() -> None:
+    """Analyze every .py file under src/ once and sync README.md, then return.
+
+    Unlike ``main()``, this does not start the watchdog observer — intended
+    for one-shot invocations (e.g. from a PostToolUse hook).
+    """
+    WATCH_DIRECTORY.mkdir(exist_ok=True)
+    modules = [
+        module
+        for path in sorted(WATCH_DIRECTORY.rglob("*.py"))
+        if (module := analyze_module(path)) is not None
+    ]
+    sync_readme(modules)
+
+
 def main() -> None:
-    """Start the file watcher and run until interrupted with Ctrl+C."""
+    """Start the file watcher (default) or run a single sync pass with --once."""
+    parser = argparse.ArgumentParser(description="Sync README.md from src/ docstrings and signatures.")
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="Run a single sync pass over src/ and exit, instead of watching for changes.",
+    )
+    args = parser.parse_args()
+
+    if args.once:
+        sync_once()
+        return
+
     WATCH_DIRECTORY.mkdir(exist_ok=True)
 
     handler = PythonFileChangeHandler()
