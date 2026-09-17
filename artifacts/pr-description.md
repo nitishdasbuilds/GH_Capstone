@@ -1,92 +1,66 @@
-# Pull Request: Automated Documentation Sync for src/ Python Files
+# Pull Request: Automated Documentation Sync Tool (`doc_sync`)
 
-**Jira Ticket**: [EPMCDMETST-62888](https://your-jira-instance/browse/EPMCDMETST-62888)
+**Jira Ticket**: [EPMCDMETST-62888](https://jiraeu.epam.com/browse/EPMCDMETST-62888)
 
 ## Summary
-This PR introduces a local file-watcher (`src/doc_sync.py`) that monitors `src/` for `.py` file changes, extracts public function signatures/docstrings via AST parsing, and regenerates the "API Usage Examples" and "Configuration Options" sections of `README.md` between `<!-- AUTO-GENERATED:START/END -->` markers, per `artifacts/requirements.md` (FR-1, FR-2, FR-3) and the monolithic event-driven design in `artifacts/architecture.md`. A sample module (`src/calculator.py`) is included to give the watcher something to analyze and document. This implementation covers only FR-1/FR-2/FR-3 (and related NFRs); Git integration (FR-6), JIRA integration (FR-7), API doc generation (FR-4), and the conditional review workflow (FR-5) are out of scope for this change.
+This PR delivers `src/doc_sync.py`, a local, standalone CLI tool that watches `src/` for `.py` file changes via `watchdog`, extracts module/function structure using Python's `ast` module (no `exec`/`import` of scanned code), and keeps clearly-delimited auto-generated sections of `README.md` in sync using rule-based templates — without touching hand-written prose. The design follows the single-process, event-driven architecture (File Watcher → Event Debouncer → Sync Orchestrator → AST Extractor → Markdown Renderer → README Sync Writer) approved in `artifacts/architecture.md`, with all Critical/High design-review findings (startup orphan reconciliation, Path Validator wiring, thread-safe debouncer) resolved prior to code review sign-off.
 
 ## Changes Made
 
 ### Added
-- `src/doc_sync.py` — Watchdog-based file watcher, AST-based code analyzer, and template-based README section generator/writer, with debouncing (0.3s) and batching (2s window, 20-file cap per D003).
-- `src/calculator.py` — Sample module (`add`, `subtract`, `multiply`, `divide`, `Calculator` class) used to exercise the watcher/analyzer; not a dependency of `doc_sync.py`.
-- `tests/test_doc_sync.py` — 29 pytest cases covering file-change detection, README update logic, timestamp logging, calculator functions, and error handling.
-- `artifacts/requirements.md`, `artifacts/architecture.md`, `artifacts/design-review.md`, `artifacts/impl-plan.md`, `artifacts/code-review.md`, `artifacts/verification-report.md` — upstream SDLC pipeline artifacts documenting requirements, design, review findings, and verification results for this change.
+- `src/__init__.py` — marks `src/` as a package so `python -m src.doc_sync --watch` works as specified.
+- `tests/__init__.py` — marks `tests/` as a package for test discovery.
 
 ### Modified
-- `README.md` — Contains the auto-generated `api_usage` and `configuration` marker sections that `doc_sync.py` updates in place.
+- `src/doc_sync.py` — implementation of the full doc-sync pipeline: `PyFileEventHandler`/`Observer`-based file watcher (FR-1), `EventDebouncer` with thread-safe buffering (resolves design-review H-2), `is_within_workspace` path validator (NFR-2), `extract_module`/`_render_signature` AST extractor covering posonly/kwonly/vararg/kwarg signatures and strict UTF-8 decoding (FR-2), `render_block` deterministic Markdown renderer (FR-3), marker-based `sync_readme`/atomic `_atomic_write` README writer (FR-3/FR-4), and `SyncOrchestrator` with startup orphan reconciliation (resolves design-review C-1) and per-file exception handling (FR-5/NFR-5, includes the two blocking-issue fixes from code review — see below).
+- `src/calculator.py` — sample module (`add`, `subtract`, `multiply`, `divide`, `Calculator` class) used to exercise the doc-sync watcher against real, documented code.
+- `tests/test_doc_sync.py` — 52-test suite covering file-change detection, README update logic, logging, calculator functions, and error handling (including regression tests for both code-review blocking issues).
+- `README.md` — auto-generated legacy content (from an earlier `AUTO-GENERATED:START:api_usage`/`:configuration` marker format that predates the current `AUTO-DOC:START module=X` architecture) was removed, leaving the hand-authored title only; the new marker format will be (re)populated by running the watcher against this codebase.
+- `status.json` — pipeline phase tracking updated as each SDLC phase completed.
+- `artifacts/requirements.md`, `artifacts/architecture.md`, `artifacts/design-review.md`, `artifacts/impl-plan.md`, `artifacts/code-review.md`, `artifacts/verification-report.md` — SDLC pipeline artifacts produced/refined across the requirements, architecture, design review, implementation planning, code review, and verification phases for this ticket.
 
 ## Test Evidence
 
-**Command**: `python -m pytest tests/ -v --tb=short`
+**Command**: `python -m pytest tests/test_doc_sync.py -v --cov=src --cov-report=term-missing`
 
 ```
 ============================= test session starts =============================
 platform win32 -- Python 3.14.5, pytest-9.1.1, pluggy-1.6.0
-collected 29 items
+collected 52 items
 
-tests/test_doc_sync.py::TestFileChangeDetection::test_py_file_modification_triggers_sync PASSED
-tests/test_doc_sync.py::TestFileChangeDetection::test_non_py_file_ignored PASSED
-tests/test_doc_sync.py::TestFileChangeDetection::test_directory_events_ignored PASSED
-tests/test_doc_sync.py::TestFileChangeDetection::test_duplicate_events_debounced PASSED
-tests/test_doc_sync.py::TestFileChangeDetection::test_flush_with_no_pending_events_does_nothing PASSED
-tests/test_doc_sync.py::TestReadmeUpdate::test_marker_section_replaced PASSED
-tests/test_doc_sync.py::TestReadmeUpdate::test_content_outside_markers_preserved PASSED
-tests/test_doc_sync.py::TestReadmeUpdate::test_missing_markers_handled_gracefully PASSED
-tests/test_doc_sync.py::TestReadmeUpdate::test_malformed_markers_start_after_end_treated_as_missing PASSED
-tests/test_doc_sync.py::TestReadmeUpdate::test_template_content_substituted_into_readme PASSED
-tests/test_doc_sync.py::TestReadmeUpdate::test_readme_preserves_prior_content_on_parse_failure FAILED
-tests/test_doc_sync.py::TestSyncLogging::test_iso_now_returns_parseable_iso8601 PASSED
-tests/test_doc_sync.py::TestSyncLogging::test_log_directory_created_if_missing PASSED
-tests/test_doc_sync.py::TestSyncLogging::test_log_appends_not_overwrites PASSED
-tests/test_doc_sync.py::TestSyncLogging::test_log_entry_has_iso8601_timestamp PASSED
-tests/test_doc_sync.py::TestCalculator::test_add PASSED
-tests/test_doc_sync.py::TestCalculator::test_subtract PASSED
-tests/test_doc_sync.py::TestCalculator::test_multiply PASSED
-tests/test_doc_sync.py::TestCalculator::test_divide PASSED
-tests/test_doc_sync.py::TestCalculator::test_divide_by_zero_raises PASSED
-tests/test_doc_sync.py::TestCalculator::test_calculator_running_total PASSED
-tests/test_doc_sync.py::TestCalculator::test_calculator_reset PASSED
-tests/test_doc_sync.py::TestCalculator::test_calculator_divide_by_zero_raises PASSED
-tests/test_doc_sync.py::TestCalculator::test_square_actually_squares_the_total XFAIL
-tests/test_doc_sync.py::TestErrorHandling::test_readme_write_failure_does_not_crash PASSED
-tests/test_doc_sync.py::TestErrorHandling::test_log_write_failure_handled PASSED
-tests/test_doc_sync.py::TestErrorHandling::test_corrupted_source_file_skipped PASSED
-tests/test_doc_sync.py::TestErrorHandling::test_deleted_file_skipped_without_crashing PASSED
-tests/test_doc_sync.py::TestErrorHandling::test_keyboard_interrupt_exits_cleanly PASSED
+tests/test_doc_sync.py .................................................... [100%]
 
-================================== FAILURES ===================================
-____ TestReadmeUpdate.test_readme_preserves_prior_content_on_parse_failure ____
-AssertionError: sync_readme() wiped previously-generated content after a parse
-failure instead of preserving it (see code-review.md Blocking Issue #1)
-=================== 1 failed, 27 passed, 1 xfailed in 0.25s ===================
+=============================== tests coverage ================================
+Name                Stmts   Miss  Cover   Missing
+-------------------------------------------------
+src\__init__.py         0      0   100%
+src\calculator.py      23      0   100%
+src\doc_sync.py       391     43    89%   198, 209, 217, 225, 346, 361-362,
+                                          418-419, 509, 546-547, 590-591,
+                                          594-596, 630-632, 638-639, 688-714, 718
+-------------------------------------------------
+TOTAL                 414     43    90%
+============================= 52 passed in 0.79s ==============================
 ```
 
-- **Total Tests**: 29
-- **Passed**: 27
-- **Failed**: 1 (`test_readme_preserves_prior_content_on_parse_failure` — reproduces Code Review Blocking Issue #1, see Known Limitations)
-- **XFailed**: 1 (`test_square_actually_squares_the_total` — reproduces a known, non-blocking `Calculator.square()` defect; marked `xfail(strict=True)`)
-- **Coverage**: 93% overall (`doc_sync.py` 95%, `calculator.py` 84%) against a 70% target
-- **Reference**: See `artifacts/verification-report.md` for full details
-
-Test evidence above was captured fresh in this session and matches `artifacts/verification-report.md` exactly (27 passed, 1 failed, 1 xfailed, 93% coverage).
+- **Total Tests**: 52
+- **Passed**: 52
+- **Failed**: 0
+- **Coverage**: 90% combined (`doc_sync.py` 89%, `calculator.py` 100%), exceeding the 70% target
+- **Reference**: See `artifacts/verification-report.md` for the full breakdown by area, including the two dedicated regression tests for the code-review blocking issues (`test_build_block_catches_render_block_exception`, `test_module_path_boundary_uses_src_dir_consistently`)
 
 ## Known Limitations
-This PR is **not** in a mergeable state as-is — `artifacts/code-review.md` recorded a "CHANGES REQUIRED" verdict with 3 blocking issues, and `artifacts/verification-report.md` recorded "PASS WITH GAPS" because one of those issues reproduces as a genuine, currently-failing test:
-
-1. **[Blocking — Correctness]** `sync_readme()` overwrites a previously-valid "API Usage Examples" section with an empty placeholder when a watched file has a transient syntax error, and only re-analyzes files in the current batch rather than the full `src/` tree — so unrelated files' documentation can be dropped on each sync. Violates the "never corrupt existing documentation" reliability requirement (NFR-3). Reproduced by the failing test above.
-2. **[Blocking — Correctness]** Log timestamps in `logs/sync.log` are not ISO-8601 compliant (`logging.Formatter` default `asctime`, e.g. `2026-09-02 14:40:08,373`) despite the implementation spec requiring ISO-8601 log timestamps. Only the console `[SYNCED]` message is truly ISO-8601.
-3. **[Blocking — Dependency Safety]** `watchdog` is imported by `doc_sync.py` but is not declared or pinned in any `requirements.txt`/`pyproject.toml` in the repository, so the project cannot be installed reproducibly in a clean environment.
-4. **[Non-blocking]** `Calculator.square()` in `src/calculator.py` is mislabeled: its docstring claims it squares the running total, but it duplicates `multiply()`'s behavior. Covered by an `xfail(strict=True)` test.
-5. **[Non-blocking / scope]** FR-4 (API documentation sync), FR-5 (conditional review workflow), FR-6 (Git integration), and FR-7 (JIRA integration) are not implemented in this PR — only FR-1/FR-2/FR-3 and the associated NFRs are addressed.
-6. **[Non-blocking]** Test coverage gaps (documented in `artifacts/verification-report.md`): the `BATCH_MAX_FILES` overflow-requeue branch and `__main__`/startup print statements are not exercised by unit tests; considered low-risk and acceptable per the verification report.
+- Uncovered lines in `src/doc_sync.py` (89% coverage) are concentrated in the `main()` live-watch blocking loop/`SIGINT` shutdown path and a few annotation-rendering sub-branches in `_render_signature`; these are documented in `artifacts/verification-report.md` as intentionally untested to avoid flaky/hanging tests, since the underlying components (`EventDebouncer.shutdown()`, `Observer` start/stop) are separately unit-tested.
+- Non-blocking code-review recommendations not yet addressed: `_atomic_write` does not preserve `README.md`'s original file permissions (inherits `tempfile.mkstemp`'s restrictive mode); the unused `ChangeEvent.kind` field is misleading and should either be used or removed; `requirements.txt` pins `watchdog==6.0.0`, which exceeds the `<5.0` ceiling originally decided in `artifacts/impl-plan.md` T002 (no recorded rationale for the change); no `pyproject.toml`/`setup.cfg` declares the minimum supported Python version per T002.
+- The implementation is a single ~700-line `src/doc_sync.py` module rather than the `src/doc_sync/` package structure originally scaffolded in `artifacts/impl-plan.md` T001; `artifacts/code-review.md` flags this as a documentation/planning divergence (Test Coverage Readiness: Partial) rather than a functional defect.
+- `README.md`'s previous auto-generated content used an older marker format and has been stripped rather than migrated; running the watcher (`python -m src.doc_sync --watch`) against this repo will regenerate the current `AUTO-DOC:START module=X` sections.
 
 ## Reviewer Checklist
 - [ ] Code changes align with `artifacts/requirements.md`
 - [ ] Architecture and design decisions in `artifacts/architecture.md` / `artifacts/design-review.md` are correctly reflected in the implementation
-- [ ] All blocking issues from `artifacts/code-review.md` have been resolved (currently **unresolved** — see Known Limitations)
-- [ ] Test evidence above is sufficient and tests pass (currently 1 known failure, reproducing a blocking defect)
-- [ ] No security concerns (secrets, unsafe file/path handling, unsafe eval/exec) — code review rated Security "Pass"
+- [ ] All blocking issues from `artifacts/code-review.md` have been resolved
+- [ ] Test evidence above is sufficient and tests pass
+- [ ] No security concerns (secrets, unsafe file/path handling, unsafe eval/exec)
 - [ ] Documentation (README, docstrings) is up to date with the change
 - [ ] Jira ticket EPMCDMETST-62888 accurately reflects the delivered scope
 
@@ -100,4 +74,4 @@ This PR is **not** in a mergeable state as-is — `artifacts/code-review.md` rec
 - Jira Ticket: EPMCDMETST-62888
 
 ## Revision History
-- 2026-09-02: Initial PR description generated by PR Agent
+- 2026-09-03: Initial PR description generated by PR Agent
