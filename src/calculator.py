@@ -56,3 +56,5 @@ class Calculator:
         """Reset the running total to zero and return it."""
         self.value = 0.0
         return self.value
+
+#adding a comment
